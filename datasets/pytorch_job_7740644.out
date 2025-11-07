@@ -1,0 +1,34 @@
+Running SLURM prolog script on gold55.cluster.local
+===============================================================================
+Job started on Sun Sep  7 09:41:23 BST 2025
+Job ID          : 7740644
+Job name        : pytorch_job
+WorkDir         : /mainfs/home/tvtn1c23/Motion_Diffusion/datasets
+Command         : /mainfs/home/tvtn1c23/preprocess.slurm
+Partition       : highmem
+Num hosts       : 1
+Num cores       : 8
+Num of tasks    : 1
+Hosts allocated : gold55
+Job Output Follows ...
+===============================================================================
+==============================================================================
+Running epilogue script on gold55.
+
+Submit time  : 2025-09-07T09:41:22
+Start time   : 2025-09-07T09:41:22
+End time     : 2025-09-07T09:41:52
+Elapsed time : 00:00:30 (Timelimit=1-12:00:00)
+
+Job ID: 7740644
+Cluster: i5
+User/Group: tvtn1c23/fp
+State: COMPLETED (exit code 0)
+Nodes: 1
+Cores per node: 8
+CPU Utilized: 00:00:06
+CPU Efficiency: 2.50% of 00:04:00 core-walltime
+Job Wall-clock time: 00:00:30
+Memory Utilized: 2.29 MB
+Memory Efficiency: 0.00% of 150.00 GB
+
