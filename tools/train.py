@@ -164,3 +164,4 @@ if __name__ == '__main__':
     train_set   = DatasetClass(opt, mean, std, train_split, opt.times)
     bad_ids = validate_dataset(train_set)
     trainer.train(train_set)
+    print("🚀 Training complete!")
