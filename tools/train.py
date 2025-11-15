@@ -115,7 +115,7 @@ if __name__ == '__main__':
         DatasetClass        = Text2MotionDataset
 
     elif opt.dataset_name == 'beat':                           # ← NEW BRANCH
-        opt.data_root       = pjoin(ROOT, 'datasets/BEAT_test')   # absolute path
+        opt.data_root       = pjoin(ROOT, 'datasets/BEAT_numpy')   # absolute path
         opt.motion_dir      = pjoin(opt.data_root, 'npy')
         opt.text_dir        = pjoin(opt.data_root, 'txt')
         opt.joints_num      = 55

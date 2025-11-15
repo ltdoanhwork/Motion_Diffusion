@@ -192,8 +192,3 @@ class Skeleton(object):
                 # print(matR.shape, offset_vec.shape)
                 joints[:, chain[i]] = torch.matmul(matR, offset_vec).squeeze(-1) + joints[:, chain[i-1]]
         return joints
-
-
-
-
-
