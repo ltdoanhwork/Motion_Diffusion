@@ -271,7 +271,7 @@ class BVHWriter():
         else:
             f.write(f"{indent}JOINT {joint_name}\n")
         
-        f.write(f"{indent}\n")
+        f.write(f"{indent}{{\n")
         
         offsets = joint['offsets']
         f.write(f"{indent}  OFFSET {offsets[0]:.6f} {offsets[1]:.6f} {offsets[2]:.6f}\n")
@@ -288,7 +288,7 @@ class BVHWriter():
             for child_name in joint['children']:
                 self._write_joint(f, data, child_name, level + 1)
         
-        f.write(f"{indent}\n")
+        f.write(f"{indent}}}\n")
     
     def _write_motion(self, f, data):
         '''Write the MOTION section'''
