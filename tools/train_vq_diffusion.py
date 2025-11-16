@@ -46,7 +46,7 @@ def create_train_split(motion_dir, split_file):
         split_file: Path to output train.txt
     """
     if os.path.exists(split_file):
-        print(f"[INFO] {split_file} already exists")
+        # print(f"[INFO] {split_file} already exists")
         return
         
     os.makedirs(os.path.dirname(split_file), exist_ok=True)
@@ -66,7 +66,7 @@ def create_train_split(motion_dir, split_file):
     if not motion_files:
         raise ValueError(f"No .npy files found in {motion_dir}")
         
-    print(f"[INFO] Found {len(motion_files)} motion files")
+    # print(f"[INFO] Found {len(motion_files)} motion files")
     
     # Sort for deterministic ordering
     motion_files_sorted = sorted(motion_files)
@@ -75,7 +75,7 @@ def create_train_split(motion_dir, split_file):
         for name in motion_files_sorted:
             f.write(f"{name}\n")
     
-    print(f"[INFO] Created {split_file}")
+    # print(f"[INFO] Created {split_file}")
 
 
 class VQDiffusionTrainer:
@@ -90,7 +90,8 @@ class VQDiffusionTrainer:
         self.device = args.device
         
         # Wrap model for GaussianDiffusion compatibility
-        self.wrapped_model = model
+        # self.wrapped_model = model
+        self.wrapped_model = VQLatentDiffusionWrapper(model)
         
         # Optimizer
         self.optimizer = optim.AdamW(
@@ -130,7 +131,28 @@ class VQDiffusionTrainer:
         with torch.no_grad():
             latent, _ = self.model.encode_to_latent(motion)
         
+        # DEBUG: Check latent shape
+        # print(f"[TRAIN DEBUG] After encode_to_latent: {latent.shape}")
+        # print(f"[TRAIN DEBUG] Expected: (B={latent.shape[0]}, T_latent={self.model.num_frames}, code_dim={self.model.vqvae.code_dim})")
+        
+        # CRITICAL FIX: Ensure latent is in (B, T, D) format
+        # VQ-VAE might return (B, D, T) or (B, T, D)
         B = latent.shape[0]
+        expected_T = self.model.num_frames
+        expected_D = self.model.vqvae.code_dim
+        
+        if latent.shape[1] == expected_D and latent.shape[2] == expected_T:
+            # Shape is (B, code_dim, T_latent) - need to transpose
+            # print(f"[TRAIN DEBUG] Transposing latent from (B, D, T) to (B, T, D)")
+            latent = latent.permute(0, 2, 1)  # (B, D, T) -> (B, T, D)
+        elif latent.shape[1] == expected_T and latent.shape[2] == expected_D:
+            # Shape is correct (B, T_latent, code_dim)
+            # print(f"[TRAIN DEBUG] Latent shape is correct (B, T, D)")
+            pass
+        else:
+            raise ValueError(f"Unexpected latent shape: {latent.shape}. Expected (B={B}, T={expected_T}, D={expected_D})")
+        
+        # print(f"[TRAIN DEBUG] Final latent shape: {latent.shape}")
         
         # Sample timesteps
         t, weights = self.schedule_sampler.sample(B, self.device)
@@ -183,7 +205,8 @@ class VQDiffusionTrainer:
         val_losses = []
         
         for batch in self.val_loader:
-            motion, text, m_lens = batch
+            # FIXED: Use same unpacking order as train_step
+            text, motion, m_lens = batch  # Was: motion, text, m_lens
             motion = motion.to(self.device).float()
             
             # Encode to latent
@@ -434,7 +457,7 @@ def main():
     
     # Load data
     stats_file_path = "/home/serverai/ltdoanh/Motion_Diffusion/global_pipeline.pkl"
-    print(f"[INFO] Loading pipeline from {stats_file_path} to extract stats...")
+    # print(f"[INFO] Loading pipeline from {stats_file_path} to extract stats...")
 
     # Dùng joblib.load để đọc file pipeline đã lưu
     try:

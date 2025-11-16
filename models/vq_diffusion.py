@@ -121,6 +121,22 @@ class VQLatentDiffusion(nn.Module):
         # Sum over quantizers to get continuous representation
         latent = all_codes.sum(dim=0)  # (B, T_latent, code_dim)
         
+        # CRITICAL: Verify and fix shape
+        # Expected: (B, T_latent, code_dim)
+        B = latent.shape[0]
+        
+        # Check if latent needs transposing
+        if latent.shape[1] == self.vqvae.code_dim and latent.shape[2] == self.num_frames:
+            # Shape is (B, code_dim, T_latent) - need to transpose
+            # print(f"[DEBUG encode_to_latent] Transposing from {latent.shape} (B,D,T) to (B,T,D)")
+            latent = latent.permute(0, 2, 1)  # (B, D, T) -> (B, T, D)
+        
+        # Final verification
+        assert latent.shape == (B, self.num_frames, self.vqvae.code_dim), \
+            f"encode_to_latent output shape mismatch: got {latent.shape}, expected ({B}, {self.num_frames}, {self.vqvae.code_dim})"
+        
+        # print(f"[DEBUG encode_to_latent] Final latent shape: {latent.shape}")
+        
         return latent, code_idx
     
     @torch.no_grad()
@@ -152,10 +168,10 @@ class VQLatentDiffusion(nn.Module):
         Forward pass for training ...
         """
         # --- THÊM KHỐI GIẢI NÉN 'y' NÀY ---
-        text = y.get('text', None)
-        length = y.get('length', None)
-        xf_proj = y.get('xf_proj', None)
-        xf_out = y.get('xf_out', None)
+        text = y.get('text', None) if y is not None else None
+        length = y.get('length', None) if y is not None else None
+        xf_proj = y.get('xf_proj', None) if y is not None else None
+        xf_out = y.get('xf_out', None) if y is not None else None
         # ---------------------------------
         
         # Check if input is already in latent space
@@ -210,8 +226,14 @@ class VQLatentDiffusion(nn.Module):
 
 class VQLatentDiffusionWrapper(nn.Module):
     """
-    Wrapper that handles the full pipeline: raw motion -> latent -> diffusion -> reconstruction
-    This is useful for training with the GaussianDiffusion class
+    Wrapper for training VQ Latent Diffusion with GaussianDiffusion.
+    
+    Key insight: During training, the flow is:
+    1. Raw motion (B, T_orig, D) -> VQ encode -> latent (B, T_latent, code_dim)  
+    2. GaussianDiffusion adds noise: latent -> x_t (noisy latent)
+    3. Model predicts: x_t -> predicted noise/x_0 in latent space
+    
+    This wrapper must handle the latent space directly (no re-encoding).
     """
     def __init__(self, vq_diffusion_model):
         super().__init__()
@@ -220,30 +242,43 @@ class VQLatentDiffusionWrapper(nn.Module):
     def forward(self, x, timesteps, **kwargs):
         """
         Args:
-            x: (B, T_original, D) raw motion data
-            timesteps: (B,) diffusion timesteps
-            **kwargs: Additional arguments (text, length, etc.)
+            x: (B, T_latent, code_dim) - noisy latent from GaussianDiffusion.q_sample()
+            timesteps: (B,) diffusion timesteps  
+            **kwargs: Contains 'y' dict with text, length, etc.
         Returns:
-            output: (B, T_latent, code_dim) predicted in latent space
+            output: (B, T_latent, code_dim) - predicted in latent space
         """
-        # Encode to latent space
-        with torch.no_grad():
-            if self.model.freeze_vqvae:
-                self.model.vqvae.eval()
-            latent, _ = self.model.encode_to_latent(x)
+        # Extract conditioning from kwargs
+        y_dict = kwargs.get('y', {})
+        text = y_dict.get('text', None)
+        length = y_dict.get('length', None)
+        xf_proj = y_dict.get('xf_proj', None)
+        xf_out = y_dict.get('xf_out', None)
         
-        # Apply diffusion model in latent space
+        # Validate input shape
+        assert x.dim() == 3, f"Expected 3D input (B, T, D), got shape {x.shape}"
+        B, T, D = x.shape
+        
+        # CRITICAL: Ensure dimensions match what transformer expects
+        # Transformer expects (B, num_frames, input_feats)
+        # We have (B, T_latent, code_dim) which should match
+        assert T == self.model.num_frames, \
+            f"Sequence length mismatch: got T={T}, expected {self.model.num_frames}"
+        assert D == self.model.vqvae.code_dim, \
+            f"Feature dim mismatch: got D={D}, expected code_dim={self.model.vqvae.code_dim}"
+                
+        # x is already in latent space with correct shape (B, T_latent, code_dim)
+        # Apply transformer to predict noise/x_0 in latent space  
         output = self.model.transformer(
-            latent,
-            timesteps,
-            length=kwargs.get('y', {}).get('length', None),
-            text=kwargs.get('y', {}).get('text', None),
-            xf_proj=kwargs.get('y', {}).get('xf_proj', None),
-            xf_out=kwargs.get('y', {}).get('xf_out', None)
+            x,  # (B, T_latent=45, code_dim=512)
+            timesteps,  # (B,)
+            length=length,
+            text=text,
+            xf_proj=xf_proj,
+            xf_out=xf_out
         )
-        
+                
         return output
-
 
 def create_vq_latent_diffusion(
     dataset_name='t2m',
