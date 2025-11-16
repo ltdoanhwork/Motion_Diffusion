@@ -1,7 +1,8 @@
 datasets/BEAT_numpy/*
 datasets/BEAT/*
+datasets/BEAT_testing
 emage_evaltools/smplx_models/smplx/SMPLX_NEUTRAL_2020.npz
 datasets/pymo/demos/data
 checkpoints
 global_pipeline.pkl
-latent-diffusion
+latent-diffusion/*
