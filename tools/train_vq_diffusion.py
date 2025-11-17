@@ -340,6 +340,8 @@ class VQDiffusionTrainer:
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
+            'mean': self.args.mean,
+            'std': self.args.std,
         }
         
         save_path = pjoin(self.args.model_dir, filename)
@@ -491,6 +493,8 @@ def main():
         std = np.array(std)
         
     print("[INFO] Mean and Std loaded successfully from .pkl file.")
+    args.mean = mean
+    args.std = std
     
     train_split_file = pjoin(args.data_root, 'train.txt')
     val_split_file = pjoin(args.data_root, 'val.txt')

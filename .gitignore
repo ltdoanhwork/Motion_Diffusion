@@ -6,3 +6,4 @@ datasets/pymo/demos/data
 checkpoints
 global_pipeline.pkl
 latent-diffusion/*
+results
