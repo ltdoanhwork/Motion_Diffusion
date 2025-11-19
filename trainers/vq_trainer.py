@@ -10,7 +10,6 @@ import torch.optim as optim
 import time
 import numpy as np
 from collections import OrderedDict, defaultdict
-# from utils.eval_t2m import evaluation_vqvae
 from utils.utils import print_current_loss
 
 import os
@@ -33,8 +32,6 @@ class RVQTokenizerTrainer:
             elif args.recons_loss == 'l1_smooth':
                 self.l1_criterion = torch.nn.SmoothL1Loss()
 
-        # self.critic = CriticWrapper(self.opt.dataset_name, self.opt.device)
-
     def forward(self, batch_data):
         motions = batch_data[1].detach().to(self.device).float()
         pred_motion, loss_commit, perplexity = self.vq_model(motions)
@@ -43,14 +40,9 @@ class RVQTokenizerTrainer:
         self.pred_motion = pred_motion
 
         loss_rec = self.l1_criterion(pred_motion, motions)
-        # pred_local_pos = pred_motion[..., 4 : (self.opt.joints_num - 1) * 3 + 4]
-        # local_pos = motions[..., 4 : (self.opt.joints_num - 1) * 3 + 4]
-        # loss_explicit = self.l1_criterion(pred_local_pos, local_pos)
 
         loss = loss_rec + self.opt.commit * loss_commit
 
-        # return loss, loss_rec, loss_vel, loss_commit, perplexity
-        # return loss, loss_rec, loss_percept, loss_commit, perplexity
         return loss, loss_rec, torch.tensor(0.0), loss_commit, perplexity
 
 
@@ -80,7 +72,7 @@ class RVQTokenizerTrainer:
         self.scheduler.load_state_dict(checkpoint['scheduler'])
         return checkpoint['ep'], checkpoint['total_it']
 
-    def train(self, train_loader, val_loader, eval_val_loader, eval_wrapper, plot_eval=None):
+    def train(self, train_loader, val_loader=None, eval_val_loader=None, eval_wrapper=None, plot_eval=None):
         self.vq_model.to(self.device)
 
         self.opt_vq_model = optim.AdamW(self.vq_model.parameters(), lr=self.opt.lr, betas=(0.9, 0.99), weight_decay=self.opt.weight_decay)
@@ -96,16 +88,14 @@ class RVQTokenizerTrainer:
         start_time = time.time()
         total_iters = self.opt.max_epoch * len(train_loader)
         print(f'Total Epochs: {self.opt.max_epoch}, Total Iters: {total_iters}')
+        
         # Tính toán độ dài một cách an toàn
+        val_len = len(val_loader) if val_loader is not None else 0
         eval_len = len(eval_val_loader) if eval_val_loader is not None else 0
-        print('Iters Per Epoch, Training: %04d, Validation: %03d' % (len(train_loader), eval_len))
-        # val_loss = 0
-        # min_val_loss = np.inf
-        # min_val_epoch = epoch
+        print('Iters Per Epoch, Training: %04d, Validation: %03d, Eval: %03d' % (len(train_loader), val_len, eval_len))
         current_lr = self.opt.lr
         logs = defaultdict(def_value, OrderedDict())
 
-        # --- THÊM KHỐI 'if/else' NÀY ---
         if eval_val_loader is not None and eval_wrapper is not None:
             best_fid, best_div, best_top1, best_top2, best_top3, best_matching, writer = evaluation_vqvae(
                 self.opt.model_dir, eval_val_loader, self.vq_model, self.logger, epoch, best_fid=1000,
@@ -114,7 +104,6 @@ class RVQTokenizerTrainer:
                 eval_wrapper=eval_wrapper, save=False)
         else:
             print("[WARN] eval_val_loader or eval_wrapper is None. Skipping FID/Diversity evaluation.")
-            # Đặt giá trị mặc định để code chạy tiếp
             best_fid, best_div, best_top1, best_top2, best_top3, best_matching, writer = (
                 1000, 100, 0, 0, 0, 100, None
             )
@@ -135,7 +124,6 @@ class RVQTokenizerTrainer:
                 
                 logs['loss'] += loss.item()
                 logs['loss_rec'] += loss_rec.item()
-                # Note it not necessarily velocity, too lazy to change the name now
                 logs['loss_vel'] += loss_vel.item()
                 logs['loss_commit'] += loss_commit.item()
                 logs['perplexity'] += perplexity.item()
@@ -157,54 +145,34 @@ class RVQTokenizerTrainer:
             self.save(pjoin(self.opt.model_dir, 'latest.tar'), epoch, it)
 
             epoch += 1
-            # if epoch % self.opt.save_every_e == 0:
-            #     self.save(pjoin(self.opt.model_dir, 'E%04d.tar' % (epoch)), epoch, total_it=it)
+            if val_loader is not None:
+                print('Validation time:')
+                self.vq_model.eval()
+                val_loss_rec = []
+                val_loss_vel = []
+                val_loss_commit = []
+                val_loss = []
+                val_perpexity = []
+                with torch.no_grad():
+                    for i, batch_data in enumerate(val_loader):
+                        loss, loss_rec, loss_vel, loss_commit, perplexity = self.forward(batch_data)
+                        val_loss.append(loss.item())
+                        val_loss_rec.append(loss_rec.item())
+                        val_loss_vel.append(loss_vel.item())
+                        val_loss_commit.append(loss_commit.item())
+                        val_perpexity.append(perplexity.item())
 
-            print('Validation time:')
-            self.vq_model.eval()
-            val_loss_rec = []
-            val_loss_vel = []
-            val_loss_commit = []
-            val_loss = []
-            val_perpexity = []
-            with torch.no_grad():
-                for i, batch_data in enumerate(val_loader):
-                    loss, loss_rec, loss_vel, loss_commit, perplexity = self.forward(batch_data)
-                    # val_loss_rec += self.l1_criterion(self.recon_motions, self.motions).item()
-                    # val_loss_emb += self.embedding_loss.item()
-                    val_loss.append(loss.item())
-                    val_loss_rec.append(loss_rec.item())
-                    val_loss_vel.append(loss_vel.item())
-                    val_loss_commit.append(loss_commit.item())
-                    val_perpexity.append(perplexity.item())
+                self.logger.add_scalar('Val/loss', sum(val_loss) / len(val_loss), epoch)
+                self.logger.add_scalar('Val/loss_rec', sum(val_loss_rec) / len(val_loss_rec), epoch)
+                self.logger.add_scalar('Val/loss_vel', sum(val_loss_vel) / len(val_loss_vel), epoch)
+                self.logger.add_scalar('Val/loss_commit', sum(val_loss_commit) / len(val_loss), epoch)
+                self.logger.add_scalar('Val/loss_perplexity', sum(val_perpexity) / len(val_loss_rec), epoch)
 
-            # val_loss = val_loss_rec / (len(val_dataloader) + 1)
-            # val_loss = val_loss / (len(val_dataloader) + 1)
-            # val_loss_rec = val_loss_rec / (len(val_dataloader) + 1)
-            # val_loss_emb = val_loss_emb / (len(val_dataloader) + 1)
-            self.logger.add_scalar('Val/loss', sum(val_loss) / len(val_loss), epoch)
-            self.logger.add_scalar('Val/loss_rec', sum(val_loss_rec) / len(val_loss_rec), epoch)
-            self.logger.add_scalar('Val/loss_vel', sum(val_loss_vel) / len(val_loss_vel), epoch)
-            self.logger.add_scalar('Val/loss_commit', sum(val_loss_commit) / len(val_loss), epoch)
-            self.logger.add_scalar('Val/loss_perplexity', sum(val_perpexity) / len(val_loss_rec), epoch)
-
-            print('Validation Loss: %.5f Reconstruction: %.5f, Velocity: %.5f, Commit: %.5f' %
-                  (sum(val_loss)/len(val_loss), sum(val_loss_rec)/len(val_loss), 
-                   sum(val_loss_vel)/len(val_loss), sum(val_loss_commit)/len(val_loss)))
-
-            # if sum(val_loss) / len(val_loss) < min_val_loss:
-            #     min_val_loss = sum(val_loss) / len(val_loss)
-            # # if sum(val_loss_vel) / len(val_loss_vel) < min_val_loss:
-            # #     min_val_loss = sum(val_loss_vel) / len(val_loss_vel)
-            #     min_val_epoch = epoch
-            #     self.save(pjoin(self.opt.model_dir, 'finest.tar'), epoch, it)
-            #     print('Best Validation Model So Far!~')
-
-            # best_fid, best_div, best_top1, best_top2, best_top3, best_matching, writer = evaluation_vqvae(
-            #     self.opt.model_dir, eval_val_loader, self.vq_model, self.logger, epoch, best_fid=best_fid,
-            #     best_div=best_div, best_top1=best_top1,
-            #     best_top2=best_top2, best_top3=best_top3, best_matching=best_matching, eval_wrapper=eval_wrapper)
-            # Thêm kiểm tra if
+                print('Validation Loss: %.5f Reconstruction: %.5f, Velocity: %.5f, Commit: %.5f' %
+                    (sum(val_loss)/len(val_loss), sum(val_loss_rec)/len(val_loss), 
+                    sum(val_loss_vel)/len(val_loss), sum(val_loss_commit)/len(val_loss)))
+            else:
+                print('[INFO] Validation skipped (val_loader=None)')
             
             if eval_val_loader is not None and eval_wrapper is not None:
 
@@ -215,8 +183,6 @@ class RVQTokenizerTrainer:
                     eval_wrapper=eval_wrapper, save=False)
             else:
                 print("[WARN] eval_val_loader or eval_wrapper is None. Skipping FID/Diversity evaluation.")
-                # Đặt giá trị mặc định để code chạy tiếp
-
                 best_fid, best_div, best_top1, best_top2, best_top3, best_matching, writer = (
                     1000, 100, 0, 0, 0, 100, None
                     )
@@ -305,11 +271,7 @@ class LengthEstTrainer(object):
                 self.estimator.train()
 
                 conds, _, m_lens = batch_data
-                # word_emb = word_emb.detach().to(self.device).float()
-                # pos_ohot = pos_ohot.detach().to(self.device).float()
-                # m_lens = m_lens.to(self.device).long()
                 text_embs = self.encode_fnc(self.text_encoder, conds, self.opt.device).detach()
-                # print(text_embs.shape, text_embs.device)
 
                 pred_dis = self.estimator(text_embs)
 
@@ -317,9 +279,7 @@ class LengthEstTrainer(object):
 
                 gt_labels = m_lens // self.opt.unit_length
                 gt_labels = gt_labels.long().to(self.device)
-                # print(gt_labels.shape, pred_dis.shape)
-                # print(gt_labels.max(), gt_labels.min())
-                # print(pred_dis)
+
                 acc = (gt_labels == pred_dis.argmax(dim=-1)).sum() / len(gt_labels)
                 loss = self.mul_cls_criterion(pred_dis, gt_labels)
 
@@ -334,7 +294,6 @@ class LengthEstTrainer(object):
                 it += 1
                 if it % self.opt.log_every == 0:
                     mean_loss = OrderedDict({'val_loss': val_loss})
-                    # self.logger.add_scalar('Val/loss', val_loss, it)
 
                     for tag, value in logs.items():
                         self.logger.add_scalar("Train/%s"%tag, value / self.opt.log_every, it)
@@ -353,15 +312,11 @@ class LengthEstTrainer(object):
 
             val_loss = 0
             val_acc = 0
-            # self.estimator.eval()
             with torch.no_grad():
                 for i, batch_data in enumerate(val_dataloader):
                     self.estimator.eval()
 
                     conds, _, m_lens = batch_data
-                    # word_emb = word_emb.detach().to(self.device).float()
-                    # pos_ohot = pos_ohot.detach().to(self.device).float()
-                    # m_lens = m_lens.to(self.device).long()
                     text_embs = self.encode_fnc(self.text_encoder, conds, self.opt.device)
                     pred_dis = self.estimator(text_embs)
 

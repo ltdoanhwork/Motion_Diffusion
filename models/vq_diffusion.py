@@ -126,10 +126,10 @@ class VQLatentDiffusion(nn.Module):
         B = latent.shape[0]
         
         # Check if latent needs transposing
-        if latent.shape[1] == self.vqvae.code_dim and latent.shape[2] == self.num_frames:
-            # Shape is (B, code_dim, T_latent) - need to transpose
-            # print(f"[DEBUG encode_to_latent] Transposing from {latent.shape} (B,D,T) to (B,T,D)")
-            latent = latent.permute(0, 2, 1)  # (B, D, T) -> (B, T, D)
+        # if latent.shape[1] == self.vqvae.code_dim and latent.shape[2] == self.num_frames:
+        #     # Shape is (B, code_dim, T_latent) - need to transpose
+        #     print(f"[DEBUG encode_to_latent] Transposing from {latent.shape} (B,D,T) to (B,T,D)")
+        latent = latent.permute(0, 2, 1)  # (B, D, T) -> (B, T, D)
         
         # Final verification
         assert latent.shape == (B, self.num_frames, self.vqvae.code_dim), \
@@ -163,15 +163,37 @@ class VQLatentDiffusion(nn.Module):
         
         return motion
     
-    def forward(self, x, timesteps, y=None, **kwargs): # <--- SỬA CHỮ KÝ HÀM
+    def forward(self, x, timesteps, y=None, **kwargs): 
         """
         Forward pass for training ...
         """
-        # --- THÊM KHỐI GIẢI NÉN 'y' NÀY ---
-        text = y.get('text', None) if y is not None else None
-        length = y.get('length', None) if y is not None else None
-        xf_proj = y.get('xf_proj', None) if y is not None else None
-        xf_out = y.get('xf_out', None) if y is not None else None
+        # --- SỬA ĐOẠN NÀY ---
+        # Logic cũ: Chỉ tìm trong y, nếu y None thì text None -> Gây lỗi
+        # text = y.get('text', None) if y is not None else None
+        # length = y.get('length', None) if y is not None else None
+        
+        # Logic mới: Tìm trong y trước, nếu không thấy hoặc y là None thì tìm trong kwargs
+        text = None
+        length = None
+        xf_proj = None
+        xf_out = None
+
+        # 1. Thử lấy từ y (nếu y là dict)
+        if y is not None:
+            text = y.get('text', None)
+            length = y.get('length', None)
+            xf_proj = y.get('xf_proj', None)
+            xf_out = y.get('xf_out', None)
+        
+        # 2. Nếu chưa có (do y=None hoặc key không tồn tại), thử lấy từ kwargs
+        if text is None:
+            text = kwargs.get('text', None)
+        if length is None:
+            length = kwargs.get('length', None)
+        if xf_proj is None:
+            xf_proj = kwargs.get('xf_proj', None)
+        if xf_out is None:
+            xf_out = kwargs.get('xf_out', None)
         # ---------------------------------
         
         # Check if input is already in latent space
@@ -281,8 +303,8 @@ class VQLatentDiffusionWrapper(nn.Module):
         return output
 
 def create_vq_latent_diffusion(
-    dataset_name='t2m',
-    vqvae_name='VQVAE_t2m',
+    dataset_name='beat',
+    vqvae_name='VQVAE_BEAT',
     checkpoints_dir='./checkpoints',
     device='cuda',
     freeze_vqvae=True,
@@ -389,61 +411,61 @@ def create_vq_latent_diffusion(
 
 
 # Example usage
-if __name__ == "__main__":
-    # Test VQLatentDiffusion
-    print("="*50)
-    print("Testing VQLatentDiffusion")
-    print("="*50)
+# if __name__ == "__main__":
+#     # Test VQLatentDiffusion
+#     print("="*50)
+#     print("Testing RVQLatentDiffusion")
+#     print("="*50)
     
-    # Create model
-    model = create_vq_latent_diffusion(
-        dataset_name='t2m',
-        vqvae_name='VQVAE_t2m',
-        device='cuda',
-        freeze_vqvae=True,
-        num_layers=6,  # Smaller for testing
-    )
+#     # Create model
+#     model = create_vq_latent_diffusion(
+#         dataset_name='beat',
+#         vqvae_name='VQVAE_BEAT',
+#         device='cuda',
+#         freeze_vqvae=True,
+#         num_layers=6,  # Smaller for testing
+#     )
     
-    print(f"\nModel created:")
-    print(f"  Total parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
-    print(f"  Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)/1e6:.2f}M")
+#     print(f"\nModel created:")
+#     print(f"  Total parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
+#     print(f"  Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)/1e6:.2f}M")
     
-    # Test forward pass with raw motion
-    B, T_original, D = 4, 196, 263
-    motion = torch.randn(B, T_original, D).cuda()
-    timesteps = torch.randint(0, 1000, (B,)).cuda()
-    text = ["a person walks forward"] * B
-    length = [196, 180, 160, 150]
+#     # Test forward pass with raw motion
+#     B, T_original, D = 4, 360, 264
+#     motion = torch.randn(B, T_original, D).cuda()
+#     timesteps = torch.randint(0, 1000, (B,)).cuda()
+#     text = ["a person walks forward"] * B
+#     length = [360, 360, 360, 360]
     
-    print(f"\nTesting forward pass:")
-    print(f"  Input motion: {motion.shape}")
-    print(f"  Timesteps: {timesteps.shape}")
+#     print(f"\nTesting forward pass:")
+#     print(f"  Input motion: {motion.shape}")
+#     print(f"  Timesteps: {timesteps.shape}")
     
-    # Encode to latent
-    with torch.no_grad():
-        latent, code_idx = model.encode_to_latent(motion)
-    print(f"  Encoded latent: {latent.shape}")
-    print(f"  Code indices: {code_idx.shape}")
+#     # Encode to latent
+#     with torch.no_grad():
+#         latent, code_idx = model.encode_to_latent(motion)
+#     print(f"  Encoded latent: {latent.shape}")
+#     print(f"  Code indices: {code_idx.shape}")
     
-    # Forward pass
-    output = model(latent, timesteps, length=length, text=text)
-    print(f"  Output (predicted): {output.shape}")
+#     # Forward pass
+#     output = model(latent, timesteps, length=length, text=text)
+#     print(f"  Output (predicted): {output.shape}")
     
-    # Decode back
-    with torch.no_grad():
-        recon = model.decode_from_latent(latent=output)
-    print(f"  Reconstructed motion: {recon.shape}")
+#     # Decode back
+#     with torch.no_grad():
+#         recon = model.decode_from_latent(latent=output)
+#     print(f"  Reconstructed motion: {recon.shape}")
     
-    # Test with wrapper
-    print(f"\nTesting with wrapper:")
-    wrapper = VQLatentDiffusionWrapper(model)
-    y_dict = {
-        'text': text,
-        'length': length
-    }
-    output_wrapper = wrapper(motion, timesteps, y=y_dict)
-    print(f"  Wrapper output: {output_wrapper.shape}")
+#     # Test with wrapper
+#     print(f"\nTesting with wrapper:")
+#     wrapper = VQLatentDiffusionWrapper(model)
+#     y_dict = {
+#         'text': text,
+#         'length': length
+#     }
+#     output_wrapper = wrapper(latent, timesteps, y=y_dict)
+#     print(f"  Wrapper output: {output_wrapper.shape}")
     
-    print("\n" + "="*50)
-    print("All tests passed!")
-    print("="*50)
+#     print("\n" + "="*50)
+#     print("All tests passed!")
+#     print("="*50)

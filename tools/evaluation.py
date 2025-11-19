@@ -451,6 +451,11 @@ def evaluate_multimodality(mm_motion_loaders, file):
     eval_dict = OrderedDict({})
     print('========== Evaluating MultiModality ==========')
     for model_name, mm_motion_loader in mm_motion_loaders.items():
+        # === THÊM ĐOẠN CHECK NÀY ===
+        if mm_motion_loader is None:
+            print(f'---> [{model_name}] Multimodality: Skipped (No Loader)')
+            continue
+        # ===========================
         mm_motion_embeddings = []
         with torch.no_grad():
             for idx, batch in enumerate(mm_motion_loader):
@@ -476,7 +481,27 @@ def get_metric_statistics(values):
     return mean, conf_interval
 
 
-def evaluation(log_file):
+def evaluation(eval_wrapper, 
+               gt_loader, 
+               eval_motion_loaders, 
+               log_file, replication_times, 
+               distortion_scale, diversity_scale, 
+               mmm_scale, r_precision_batch,
+               atching_score_batch, window_size, 
+               batch_size_eval
+            ):
+    # === FIX: THÊM CÁC DÒNG NÀY VÀO ĐẦU HÀM ===
+    # Khai báo các giá trị mặc định bị thiếu
+    replication_times = 1      # Số lần lặp lại đánh giá (để 1 cho nhanh, 20 cho chuẩn)
+    batch_size_eval = 32       # Batch size
+    matching_score_batch = 32
+    r_precision_batch = 32
+    window_size = 20           # Cửa sổ đánh giá (BEAT/HumanML3D dùng 20)
+    
+    # Các hệ số scale (giữ mặc định là 1.0)
+    distortion_scale = 1.0
+    diversity_scale = 1.0
+    mmm_scale = 1.0
     with open(log_file, 'w') as f:
         all_metrics = OrderedDict({'Matching Score': OrderedDict({}),
                                    'R_precision': OrderedDict({}),

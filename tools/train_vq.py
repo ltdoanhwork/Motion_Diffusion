@@ -25,8 +25,6 @@ from datasets.dataset import Beat2MotionDataset as DatasetClass
 from utils.fixseed import fixseed
 
 
-# --- 3. HÀM HỖ TRỢ TẠO SPLIT (Tương tự như trong train_vq_diffusion.py) ---
-
 def create_train_split(motion_dir, split_file):
     """Tự động tạo train.txt từ tất cả file .npy"""
     if os.path.exists(split_file):
@@ -87,8 +85,6 @@ def create_val_split(train_file, val_file, val_ratio=0.1):
     print(f"[INFO] {train_file} updated, now has {len(train_lines)} samples.")
 
 
-# --- 4. LỚP OPTION GIẢ LẬP (Cho Dataset) ---
-
 class DummyOpt:
     """Giả lập các options mà Beat2MotionDataset cần."""
     def __init__(self, args, is_train):
@@ -100,8 +96,6 @@ class DummyOpt:
         self.is_train = is_train
         self.meta_dir = args.meta_dir
         self.joints_num = args.joints_num # Cần cho vq_trainer
-
-# --- 5. HÀM MAIN ---
 
 def main():
     parser = argparse.ArgumentParser()
@@ -156,8 +150,6 @@ def main():
     args.save_root = pjoin(args.checkpoints_dir, args.dataset_name, args.name)
     args.model_dir = pjoin(args.save_root, 'model')
     args.log_dir = pjoin(args.save_root, 'logs')
-    args.eval_dir = pjoin(args.save_root, 'eval')
-    args.meta_dir = pjoin(args.save_root, 'meta') # Để trainer lưu mean/std (nếu cần)
 
     os.makedirs(args.model_dir, exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
@@ -186,18 +178,13 @@ def main():
 
     # --- 10. TẠO DATA LOADER ---
     train_split_file = pjoin(args.data_root, 'train.txt')
-    val_split_file = pjoin(args.data_root, 'val.txt')
 
     # Tự động tạo split nếu chưa có
     create_train_split(args.motion_dir, train_split_file)
-    create_val_split(train_split_file, val_split_file, val_ratio=0.1)
 
-    # Tạo các "opt" giả lập cho dataset
     train_opt = DummyOpt(args, is_train=True)
-    val_opt = DummyOpt(args, is_train=False)
 
     train_dataset = DatasetClass(train_opt, mean, std, train_split_file)
-    val_dataset = DatasetClass(val_opt, mean, std, val_split_file)
 
     train_loader = DataLoader(
         train_dataset,
@@ -207,19 +194,10 @@ def main():
         pin_memory=True,
         drop_last=True
     )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=False
-    )
     
     print(f"Train dataset: {len(train_dataset)} samples")
     # print(f"Validation dataset: {len(val_dataset)} samples")
 
-    # --- 11. KHỞI TẠO MÔ HÌNH VQ-VAE ---
     # --- 11. KHỞI TẠO MÔ HÌNH VQ-VAE ---
     # Cập nhật các tham số cho RVQVAE từ 'args'
     # (Vì RVQVAE cần 'args' để cấu hình ResidualVQ)
@@ -247,15 +225,13 @@ def main():
 
     # --- 12. KHỞI TẠO TRAINER ---
     # args (từ argparse) được truyền vào, trainer sẽ tự lấy các giá trị
-    trainer = RVQTokenizerTrainer(args, model)
+    trainer = RVQTokenizerTrainer(args, model)  
 
     # --- 13. HUẤN LUYỆN ---
     print("Starting VQ-VAE Training...")
     trainer.train(
         train_loader, 
-        val_loader,
-        # ***LƯU Ý QUAN TRỌNG VỀ EVALUATION***
-        # Truyền None cho các tham số eval của t2m
+        val_loader=None,
         eval_val_loader=None, 
         eval_wrapper=None, 
         plot_eval=None

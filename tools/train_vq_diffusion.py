@@ -377,7 +377,7 @@ def main():
     parser.add_argument('--times', type=int, default=1, help='Dataset repeat times (for BEAT)')
     
     # VQ-VAE
-    parser.add_argument('--vqvae_name', type=str, default='VQVAE_t2m')
+    parser.add_argument('--vqvae_name', type=str, default='VQVAE_BEAT')
     parser.add_argument('--freeze_vqvae', action='store_true', default=True)
     
     # Diffusion model
@@ -394,7 +394,7 @@ def main():
     parser.add_argument('--schedule_sampler', type=str, default='uniform')
     
     # Training
-    parser.add_argument('--max_epoch', type=int, default=100)
+    parser.add_argument('--max_epoch', type=int, default=10)
     parser.add_argument('--lr', type=float, default=2e-4)
     parser.add_argument('--weight_decay', type=float, default=0.0)
     parser.add_argument('--grad_clip', type=float, default=1.0)
@@ -440,6 +440,7 @@ def main():
         args.joints_num = 22
         args.max_motion_length = 196
         dim_pose = 263
+
     elif args.dataset_name == 'kit':
         args.data_root = './dataset/KIT-ML/'
         args.motion_dir = pjoin(args.data_root, 'new_joint_vecs')
@@ -447,6 +448,7 @@ def main():
         args.joints_num = 21
         args.max_motion_length = 196
         dim_pose = 251
+
     elif args.dataset_name == 'beat':
         args.data_root = './datasets/BEAT_numpy'
         args.motion_dir = pjoin(args.data_root, 'npy')
@@ -497,7 +499,6 @@ def main():
     args.std = std
     
     train_split_file = pjoin(args.data_root, 'train.txt')
-    val_split_file = pjoin(args.data_root, 'val.txt')
     
     # Create datasets
     class DummyOpt:
@@ -513,11 +514,12 @@ def main():
     
     # dummy_opt = DummyOpt(args)
     train_opt = DummyOpt(args, is_train=True)
-    val_opt = DummyOpt(args, is_train=False)
+    # val_opt = DummyOpt(args, is_train=False)
     
     # Select dataset class based on dataset_name
     if args.dataset_name in ['t2m', 'kit']:
-        from data.t2m_dataset import Text2MotionDataset as DatasetClass
+        # from data.t2m_dataset import Text2MotionDataset as DatasetClass
+        print("[INFO] Using Text2MotionDataset for T2M/KIT")
     elif args.dataset_name == 'beat':
         from datasets.dataset import Beat2MotionDataset as DatasetClass
     else:
@@ -528,8 +530,6 @@ def main():
         create_train_split(args.motion_dir, train_split_file)
     
     train_dataset = DatasetClass(train_opt, mean, std, train_split_file, getattr(args, 'times', 1))
-    val_dataset = DatasetClass(val_opt, mean, std, val_split_file, getattr(args, 'times', 1))
-    # val_dataset = None
     
     train_loader = DataLoader(
         train_dataset,
@@ -540,17 +540,7 @@ def main():
         pin_memory=True
     )
     
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        drop_last=False,
-        pin_memory=True
-    )
-    
     print(f"Train dataset: {len(train_dataset)} samples")
-    # print(f"Val dataset: {len(val_dataset)} samples")
     
     # Create model
     model = create_vq_latent_diffusion(
@@ -590,7 +580,7 @@ def main():
         model=model,
         diffusion=diffusion,
         data_loader=train_loader,
-        val_loader=val_loader
+        val_loader=None
     )
     
     # Resume from checkpoint if specified
