@@ -18,7 +18,6 @@ import sys
 def def_value():
     return 0.0
 
-
 class RVQTokenizerTrainer:
     def __init__(self, args, vq_model):
         self.opt = args
@@ -27,23 +26,52 @@ class RVQTokenizerTrainer:
 
         if args.is_train:
             self.logger = SummaryWriter(args.log_dir)
+            # Khởi tạo Loss function
             if args.recons_loss == 'l1':
                 self.l1_criterion = torch.nn.L1Loss()
             elif args.recons_loss == 'l1_smooth':
                 self.l1_criterion = torch.nn.SmoothL1Loss()
 
+    def calculate_velocity(self, motion):
+        # Motion shape: (Batch, Time, Dim)
+        # Vận tốc = Frame[t] - Frame[t-1]
+        return motion[:, 1:] - motion[:, :-1]
+
     def forward(self, batch_data):
         motions = batch_data[1].detach().to(self.device).float()
-        pred_motion, loss_commit, perplexity = self.vq_model(motions)
+        
+        # Forward qua model
+        # loss_vq bao gồm: Commitment Loss (+ Codebook Loss nếu không dùng EMA)
+        pred_motion, loss_vq, perplexity = self.vq_model(motions)
         
         self.motions = motions
         self.pred_motion = pred_motion
-
+        
+        # Thành phần 1: Reconstruction Loss (Vị trí khớp)
         loss_rec = self.l1_criterion(pred_motion, motions)
 
-        loss = loss_rec + self.opt.commit * loss_commit
+        # Thành phần 2: Velocity Loss (Độ mượt & Hướng chuyển động)
+        # Giúp giảm hiện tượng trượt chân (foot sliding) và rung lắc
+        gt_velocity = self.calculate_velocity(motions)
+        pred_velocity = self.calculate_velocity(pred_motion)
+        loss_vel = self.l1_criterion(pred_velocity, gt_velocity)
 
-        return loss, loss_rec, torch.tensor(0.0), loss_commit, perplexity
+        # Thành phần 3: VQ Loss (Đã được tính từ model trả về)
+        # (Thường là Commitment Loss)
+        loss_commit = loss_vq 
+
+        # --- 3. TỔNG HỢP LOSS ---
+        # Trọng lượng loss (Weights):
+        # recons: 1.0 (mặc định)
+        # velocity: 0.5 (hoặc lấy từ args nếu có)
+        # commit: lấy từ args.commit (thường là 0.02)
+        
+        weight_vel = getattr(self.opt, 'loss_vel_weight', 0.5) # Mặc định 0.5 nếu không config
+        
+        loss = loss_rec + (weight_vel * loss_vel) + (self.opt.commit * loss_commit)
+
+        # Trả về đầy đủ để log ra màn hình
+        return loss, loss_rec, loss_vel, loss_commit, perplexity
 
 
     # @staticmethod
@@ -89,10 +117,6 @@ class RVQTokenizerTrainer:
         total_iters = self.opt.max_epoch * len(train_loader)
         print(f'Total Epochs: {self.opt.max_epoch}, Total Iters: {total_iters}')
         
-        # Tính toán độ dài một cách an toàn
-        val_len = len(val_loader) if val_loader is not None else 0
-        eval_len = len(eval_val_loader) if eval_val_loader is not None else 0
-        print('Iters Per Epoch, Training: %04d, Validation: %03d, Eval: %03d' % (len(train_loader), val_len, eval_len))
         current_lr = self.opt.lr
         logs = defaultdict(def_value, OrderedDict())
 
@@ -103,7 +127,7 @@ class RVQTokenizerTrainer:
                 best_top2=0, best_top3=0, best_matching=100,
                 eval_wrapper=eval_wrapper, save=False)
         else:
-            print("[WARN] eval_val_loader or eval_wrapper is None. Skipping FID/Diversity evaluation.")
+            # print("[WARN] eval_val_loader or eval_wrapper is None. Skipping FID/Diversity evaluation.")
             best_fid, best_div, best_top1, best_top2, best_top3, best_matching, writer = (
                 1000, 100, 0, 0, 0, 100, None
             )
@@ -115,8 +139,12 @@ class RVQTokenizerTrainer:
                 if it < self.opt.warm_up_iter:
                     current_lr = self.update_lr_warm_up(it, self.opt.warm_up_iter, self.opt.lr)
                 loss, loss_rec, loss_vel, loss_commit, perplexity = self.forward(batch_data)
+
                 self.opt_vq_model.zero_grad()
                 loss.backward()
+
+                torch.nn.utils.clip_grad_norm_(self.vq_model.parameters(), max_norm=1.0)
+
                 self.opt_vq_model.step()
 
                 if it >= self.opt.warm_up_iter:
@@ -129,15 +157,22 @@ class RVQTokenizerTrainer:
                 logs['perplexity'] += perplexity.item()
                 logs['lr'] += self.opt_vq_model.param_groups[0]['lr']
 
-                if it % self.opt.log_every == 0:
-                    mean_loss = OrderedDict()
-                    # self.logger.add_scalar('val_loss', val_loss, it)
-                    # self.l
-                    for tag, value in logs.items():
-                        self.logger.add_scalar('Train/%s'%tag, value / self.opt.log_every, it)
-                        mean_loss[tag] = value / self.opt.log_every
-                    logs = defaultdict(def_value, OrderedDict())
-                    print_current_loss(start_time, it, mean_loss, epoch=epoch, inner_iter=i)
+                mean_loss = OrderedDict()
+                # self.logger.add_scalar('val_loss', val_loss, it)
+                # self.l
+                for tag, value in logs.items():
+                    self.logger.add_scalar('Train/%s'%tag, value / self.opt.log_every, it)
+                    mean_loss[tag] = value / self.opt.log_every
+                logs = defaultdict(def_value, OrderedDict())
+                
+                print(f"Epoch: {epoch:03d} | Iter: {it:06d} | "
+                        f"Loss: {mean_loss['loss']:.4f} | "
+                        f"Rec: {mean_loss['loss_rec']:.4f} | "
+                        f"Vel: {mean_loss['loss_vel']:.4f} | "    
+                        f"Commit: {mean_loss['loss_commit']:.4f} | "
+                        f"LR: {mean_loss['lr']:.6f}")
+                    
+                    # print_current_loss(start_time, it, mean_loss, epoch=epoch, inner_iter=i)
 
                 if it % self.opt.save_latest == 0:
                     self.save(pjoin(self.opt.model_dir, 'latest.tar'), epoch, it)
@@ -182,21 +217,10 @@ class RVQTokenizerTrainer:
                     best_top2=0, best_top3=0, best_matching=100,
                     eval_wrapper=eval_wrapper, save=False)
             else:
-                print("[WARN] eval_val_loader or eval_wrapper is None. Skipping FID/Diversity evaluation.")
+                # print("[WARN] eval_val_loader or eval_wrapper is None. Skipping FID/Diversity evaluation.")
                 best_fid, best_div, best_top1, best_top2, best_top3, best_matching, writer = (
                     1000, 100, 0, 0, 0, 100, None
                     )
-
-
-            if epoch % self.opt.eval_every_e == 0:
-                data = torch.cat([self.motions[:4], self.pred_motion[:4]], dim=0).detach().cpu().numpy()
-                # np.save(pjoin(self.opt.eval_dir, 'E%04d.npy' % (epoch)), data)
-                save_dir = pjoin(self.opt.eval_dir, 'E%04d' % (epoch))
-                os.makedirs(save_dir, exist_ok=True)
-                if plot_eval is not None:
-                    save_dir = pjoin(self.opt.eval_dir, 'E%04d' % (epoch))
-                    os.makedirs(save_dir, exist_ok=True)
-                    plot_eval(data, save_dir)
 
             # if epoch - min_val_epoch >= self.opt.early_stop_e:
             #     print('Early Stopping!~')

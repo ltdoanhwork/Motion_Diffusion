@@ -290,30 +290,16 @@ class VQDiffusionTrainer:
                 epoch_losses.append(losses['loss'])
                 self.global_step += 1
                 
-                # Logging
-                if self.global_step % self.args.log_every == 0:
-                    avg_loss = np.mean(epoch_losses[-self.args.log_every:])
-                    print(f"Epoch {epoch} | Step {self.global_step} | "
-                          f"Loss: {avg_loss:.4f} | LR: {losses['lr']:.6f}")
+                avg_loss = np.mean(epoch_losses[-self.args.log_every:])
+                print(f"Epoch: {epoch:03d} | Step: {self.global_step:06d} | "
+                        f"Loss: {avg_loss:.4f} | LR: {losses['lr']:.8f}")
                     
-                    self.logger.add_scalar('train/loss', avg_loss, self.global_step)
-                    self.logger.add_scalar('train/lr', losses['lr'], self.global_step)
+                self.logger.add_scalar('train/loss', avg_loss, self.global_step)
+                self.logger.add_scalar('train/lr', losses['lr'], self.global_step)
                 
                 # Save checkpoint
                 if self.global_step % self.args.save_every == 0:
                     self.save_checkpoint('latest.pt')
-            
-            # Validation
-            if self.val_loader is not None and epoch % self.args.eval_every == 0:
-                val_loss = self.validate()
-                print(f"Epoch {epoch} | Val Loss: {val_loss:.4f}")
-                self.logger.add_scalar('val/loss', val_loss, epoch)
-                
-                # Save best model
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    self.save_checkpoint('best.pt')
-                    print(f"New best model saved! Val Loss: {val_loss:.4f}")
             
             # Save epoch checkpoint
             if epoch % self.args.save_epoch_every == 0:

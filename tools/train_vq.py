@@ -94,7 +94,6 @@ class DummyOpt:
         self.dataset_name = args.dataset_name
         self.motion_rep = args.motion_rep
         self.is_train = is_train
-        self.meta_dir = args.meta_dir
         self.joints_num = args.joints_num # Cần cho vq_trainer
 
 def main():
@@ -114,9 +113,9 @@ def main():
     parser.add_argument('--joints_num', type=int, default=55, help='Số khớp (55 cho BEAT)')
 
     # --- Training Params ---
-    parser.add_argument('--max_epoch', type=int, default=100, help='Số epoch tối đa')
+    parser.add_argument('--max_epoch', type=int, default=10, help='Số epoch tối đa')
     parser.add_argument('--batch_size', type=int, default=64, help='Batch size')
-    parser.add_argument('--lr', type=float, default=2e-4, help='Learning rate')
+    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay')
     parser.add_argument('--is_continue', action='store_true', help='Tiếp tục training từ checkpoint "latest.tar"')
     parser.add_argument('--num_workers', type=int, default=4, help='Số luồng tải data')
@@ -153,8 +152,6 @@ def main():
 
     os.makedirs(args.model_dir, exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
-    os.makedirs(args.eval_dir, exist_ok=True)
-    os.makedirs(args.meta_dir, exist_ok=True)
     
     # --- 8. CẤU HÌNH DATASET (BEAT) ---
     args.motion_dir = pjoin(args.data_root, 'npy')

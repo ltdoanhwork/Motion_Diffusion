@@ -474,7 +474,7 @@ mm_dataset = MMGeneratedDataset(mm_generated_motions, opt)
 mm_loader = DataLoader(mm_dataset, batch_size=1, num_workers=1)
 
 # ==========================================
-# 7. Evaluation - FIX LỖI
+# 7. Evaluation 
 # ==========================================
 log_file = os.path.join(opt.result_dir, 'evaluation_log.txt')
 

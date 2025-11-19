@@ -167,12 +167,9 @@ class VQLatentDiffusion(nn.Module):
         """
         Forward pass for training ...
         """
-        # --- SỬA ĐOẠN NÀY ---
-        # Logic cũ: Chỉ tìm trong y, nếu y None thì text None -> Gây lỗi
-        # text = y.get('text', None) if y is not None else None
-        # length = y.get('length', None) if y is not None else None
+
         
-        # Logic mới: Tìm trong y trước, nếu không thấy hoặc y là None thì tìm trong kwargs
+        # Tìm trong y trước, nếu không thấy hoặc y là None thì tìm trong kwargs
         text = None
         length = None
         xf_proj = None

@@ -348,8 +348,8 @@ class Beat2MotionDataset(Dataset):
             caption = text_d.get('caption', '<no caption>')
             if not isinstance(caption, str):
                 raise TypeError(f"caption is not string: {caption}")
-            print(f"[INFO] {name} | len: {m_len} | caption: {caption}")
-            print(f"  motion shape: {motion.shape} ")
+            # print(f"[INFO] {name} | len: {m_len} | caption: {caption}")
+            # print(f"  motion shape: {motion.shape} ")
             return caption, motion.astype(np.float32), m_len
 
         except Exception as e:
