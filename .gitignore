@@ -1,5 +1,6 @@
 datasets/BEAT_numpy/*
 datasets/BEAT/*
+datasets/BEAT_beta/*
 datasets/BEAT_testing
 emage_evaltools/smplx_models/smplx/SMPLX_NEUTRAL_2020.npz
 datasets/pymo/demos/data

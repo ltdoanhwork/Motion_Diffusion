@@ -371,7 +371,7 @@ def create_vq_latent_diffusion(
         dataset_name, 
         vqvae_name, 
         'model', 
-        'finest.tar'
+        'latest.tar'
     )
     
     if not os.path.exists(vqvae_checkpoint):

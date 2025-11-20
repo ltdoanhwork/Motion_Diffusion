@@ -113,7 +113,7 @@ def main():
     parser.add_argument('--joints_num', type=int, default=55, help='Số khớp (55 cho BEAT)')
 
     # --- Training Params ---
-    parser.add_argument('--max_epoch', type=int, default=10, help='Số epoch tối đa')
+    parser.add_argument('--max_epoch', type=int, default=50, help='Số epoch tối đa')
     parser.add_argument('--batch_size', type=int, default=64, help='Batch size')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay')

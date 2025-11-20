@@ -371,7 +371,7 @@ def main():
     parser.add_argument('--num_layers', type=int, default=8)
     parser.add_argument('--num_heads', type=int, default=8)
     parser.add_argument('--ff_size', type=int, default=1024)
-    parser.add_argument('--dropout', type=float, default=0.1)
+    parser.add_argument('--dropout', type=float, default=0.2)
     parser.add_argument('--no_eff', action='store_true', help='Use standard attention instead of efficient')
     
     # Diffusion
@@ -380,9 +380,9 @@ def main():
     parser.add_argument('--schedule_sampler', type=str, default='uniform')
     
     # Training
-    parser.add_argument('--max_epoch', type=int, default=10)
+    parser.add_argument('--max_epoch', type=int, default=100)
     parser.add_argument('--lr', type=float, default=2e-4)
-    parser.add_argument('--weight_decay', type=float, default=0.0)
+    parser.add_argument('--weight_decay', type=float, default=0.01)
     parser.add_argument('--grad_clip', type=float, default=1.0)
     
     # Logging
