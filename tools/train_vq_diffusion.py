@@ -1,6 +1,7 @@
 """
 Training script for VQ-VAE Latent Diffusion with MotionDiffuse
 Integrates with GaussianDiffusion from document 7
+UPDATED: Added Validation Loop and Best Model Saving
 """
 
 import os
@@ -17,6 +18,7 @@ import torch
 import numpy as np
 import pickle
 import joblib
+import random
 
 from os.path import join as pjoin
 from torch.utils.data import DataLoader
@@ -36,46 +38,50 @@ from models.gaussian_diffusion import (
 from utils.fixseed import fixseed
 from datasets.pymo import *
 
-def create_train_split(motion_dir, split_file):
+def create_split_files(motion_dir, train_file, val_file, val_ratio=0.1):
     """
-    Auto-create train.txt by listing all .npy files in motion_dir.
-    Useful for BEAT dataset which doesn't have pre-defined splits.
-    
-    Args:
-        motion_dir: Path to directory containing .npy motion files
-        split_file: Path to output train.txt
+    Auto-create train.txt and val.txt by listing all .npy files.
+    Splits the data randomly if val.txt doesn't exist.
     """
-    if os.path.exists(split_file):
-        # print(f"[INFO] {split_file} already exists")
+    # Nếu cả 2 file đều tồn tại thì không làm gì cả
+    if os.path.exists(train_file) and os.path.exists(val_file):
         return
-        
-    os.makedirs(os.path.dirname(split_file), exist_ok=True)
+
+    print(f"[INFO] Creating split files from {motion_dir}...")
+    os.makedirs(os.path.dirname(train_file), exist_ok=True)
     
-    # Walk recursively to pick up .npy files inside subfolders
+    # Walk recursively to pick up .npy files
     motion_files = []
     for root, _, files in os.walk(motion_dir):
         for f in files:
             if f.endswith('.npy'):
                 full = os.path.join(root, f)
-                # Write relative path from motion_dir, without extension
                 rel = os.path.relpath(full, motion_dir)
                 name = os.path.splitext(rel)[0]
-                # Normalize path separators
                 motion_files.append(name.replace('\\', '/'))
     
     if not motion_files:
         raise ValueError(f"No .npy files found in {motion_dir}")
-        
-    # print(f"[INFO] Found {len(motion_files)} motion files")
     
-    # Sort for deterministic ordering
-    motion_files_sorted = sorted(motion_files)
+    # Shuffle and split
+    motion_files = sorted(motion_files)
+    random.shuffle(motion_files)
     
-    with open(split_file, 'w', encoding='utf-8') as f:
-        for name in motion_files_sorted:
+    val_size = int(len(motion_files) * val_ratio)
+    val_files = motion_files[:val_size]
+    train_files = motion_files[val_size:]
+    
+    # Write files
+    with open(train_file, 'w', encoding='utf-8') as f:
+        for name in train_files:
             f.write(f"{name}\n")
-    
-    # print(f"[INFO] Created {split_file}")
+            
+    with open(val_file, 'w', encoding='utf-8') as f:
+        for name in val_files:
+            f.write(f"{name}\n")
+            
+    print(f"[INFO] Created {train_file} ({len(train_files)} samples)")
+    print(f"[INFO] Created {val_file} ({len(val_files)} samples)")
 
 
 class VQDiffusionTrainer:
@@ -86,11 +92,10 @@ class VQDiffusionTrainer:
         self.model = model
         self.diffusion = diffusion
         self.data_loader = data_loader
-        self.val_loader = val_loader
+        self.val_loader = val_loader # Store val_loader
         self.device = args.device
         
         # Wrap model for GaussianDiffusion compatibility
-        # self.wrapped_model = model
         self.wrapped_model = VQLatentDiffusionWrapper(model)
         
         # Optimizer
@@ -131,28 +136,18 @@ class VQDiffusionTrainer:
         with torch.no_grad():
             latent, _ = self.model.encode_to_latent(motion)
         
-        # DEBUG: Check latent shape
-        # print(f"[TRAIN DEBUG] After encode_to_latent: {latent.shape}")
-        # print(f"[TRAIN DEBUG] Expected: (B={latent.shape[0]}, T_latent={self.model.num_frames}, code_dim={self.model.vqvae.code_dim})")
-        
         # CRITICAL FIX: Ensure latent is in (B, T, D) format
-        # VQ-VAE might return (B, D, T) or (B, T, D)
         B = latent.shape[0]
         expected_T = self.model.num_frames
         expected_D = self.model.vqvae.code_dim
         
         if latent.shape[1] == expected_D and latent.shape[2] == expected_T:
             # Shape is (B, code_dim, T_latent) - need to transpose
-            # print(f"[TRAIN DEBUG] Transposing latent from (B, D, T) to (B, T, D)")
-            latent = latent.permute(0, 2, 1)  # (B, D, T) -> (B, T, D)
+            latent = latent.permute(0, 2, 1)
         elif latent.shape[1] == expected_T and latent.shape[2] == expected_D:
-            # Shape is correct (B, T_latent, code_dim)
-            # print(f"[TRAIN DEBUG] Latent shape is correct (B, T, D)")
             pass
         else:
-            raise ValueError(f"Unexpected latent shape: {latent.shape}. Expected (B={B}, T={expected_T}, D={expected_D})")
-        
-        # print(f"[TRAIN DEBUG] Final latent shape: {latent.shape}")
+            raise ValueError(f"Unexpected latent shape: {latent.shape}")
         
         # Sample timesteps
         t, weights = self.schedule_sampler.sample(B, self.device)
@@ -200,19 +195,29 @@ class VQDiffusionTrainer:
     @torch.no_grad()
     def validate(self):
         """Validation loop"""
+        if self.val_loader is None:
+            return None
+
         self.model.eval()
-        
         val_losses = []
         
+        # print(f"[INFO] Running validation on {len(self.val_loader)} batches...")
+        
         for batch in self.val_loader:
-            # FIXED: Use same unpacking order as train_step
-            text, motion, m_lens = batch  # Was: motion, text, m_lens
+            text, motion, m_lens = batch
             motion = motion.to(self.device).float()
             
             # Encode to latent
             latent, _ = self.model.encode_to_latent(motion)
-            
+
+            # Handle Dimensions (same as train_step)
+            expected_T = self.model.num_frames
+            expected_D = self.model.vqvae.code_dim
+            if latent.shape[1] == expected_D and latent.shape[2] == expected_T:
+                latent = latent.permute(0, 2, 1)
+
             B = latent.shape[0]
+            # For validation, we usually fix t or sample random t
             t = torch.randint(0, self.diffusion.num_timesteps, (B,), device=self.device)
             
             model_kwargs = {
@@ -232,7 +237,8 @@ class VQDiffusionTrainer:
             loss = compute_losses['mse'].mean()
             val_losses.append(loss.item())
         
-        return np.mean(val_losses)
+        avg_val_loss = np.mean(val_losses)
+        return avg_val_loss
     
     @torch.no_grad()
     def sample(self, text, lengths, num_samples=1):
@@ -243,7 +249,6 @@ class VQDiffusionTrainer:
         T_latent = self.model.num_frames
         code_dim = self.model.latent_dim
         
-        # Prepare shape for latent space
         shape = (B * num_samples, T_latent, code_dim)
         
         model_kwargs = {
@@ -253,19 +258,31 @@ class VQDiffusionTrainer:
             }
         }
         
-        # Sample from diffusion model
-        latent_samples = self.diffusion.p_sample_loop(
-            self.wrapped_model,
-            shape,
-            clip_denoised=False,
-            model_kwargs=model_kwargs,
-            device=self.device,
-            progress=True
-        )
+        print(f"Sampling with {self.args.sampler} (eta={self.args.ddim_eta})...")
+
+        if self.args.sampler == 'ddpm':
+            latent_samples = self.diffusion.p_sample_loop(
+                self.wrapped_model,
+                shape,
+                clip_denoised=False,
+                model_kwargs=model_kwargs,
+                device=self.device,
+                progress=True
+            )
+        elif self.args.sampler == 'ddim':
+            latent_samples = self.diffusion.ddim_sample_loop(
+                self.wrapped_model,
+                shape,
+                clip_denoised=False,
+                model_kwargs=model_kwargs,
+                device=self.device,
+                progress=True,
+                eta=self.args.ddim_eta 
+            )
+        else:
+            raise ValueError(f"Unknown sampler: {self.args.sampler}")
         
-        # Decode to motion space
         motion_samples = self.model.decode_from_latent(latent=latent_samples)
-        
         return motion_samples
     
     def train(self):
@@ -274,8 +291,9 @@ class VQDiffusionTrainer:
         print("Starting VQ Latent Diffusion Training")
         print("="*50)
         print(f"Epochs: {self.args.max_epoch}")
-        print(f"Batches per epoch: {len(self.data_loader)}")
-        print(f"Total steps: {self.args.max_epoch * len(self.data_loader)}")
+        print(f"Train batches: {len(self.data_loader)}")
+        if self.val_loader:
+            print(f"Val batches:   {len(self.val_loader)}")
         print("="*50)
         
         best_val_loss = float('inf')
@@ -284,38 +302,43 @@ class VQDiffusionTrainer:
             self.epoch = epoch
             epoch_losses = []
             
-            # Training
+            # --- Training ---
             for batch_idx, batch in enumerate(self.data_loader):
                 losses = self.train_step(batch)
                 epoch_losses.append(losses['loss'])
                 self.global_step += 1
                 
-                avg_loss = np.mean(epoch_losses[-self.args.log_every:])
-                print(f"Epoch: {epoch:03d} | Step: {self.global_step:06d} | "
-                        f"Loss: {avg_loss:.4f} | LR: {losses['lr']:.8f}")
+                # Logging
+                if self.global_step % self.args.log_every == 0:
+                    avg_loss = np.mean(epoch_losses[-self.args.log_every:])
+                    print(f"Epoch: {epoch:03d} | Step: {self.global_step:06d} | "
+                          f"Loss: {avg_loss:.4f} | LR: {losses['lr']:.8f}")
                     
-                self.logger.add_scalar('train/loss', avg_loss, self.global_step)
-                self.logger.add_scalar('train/lr', losses['lr'], self.global_step)
+                    self.logger.add_scalar('train/loss', avg_loss, self.global_step)
+                    self.logger.add_scalar('train/lr', losses['lr'], self.global_step)
                 
-                # Save checkpoint
+                # Save periodic checkpoint (based on steps)
                 if self.global_step % self.args.save_every == 0:
                     self.save_checkpoint('latest.pt')
-            
+
+            # --- Validation & Saving ---
+            if self.val_loader is not None and epoch % self.args.eval_every == 0:
+                val_loss = self.validate()
+                self.logger.add_scalar('val/loss', val_loss, self.global_step)
+                print(f"Epoch: {epoch:03d} | Validation Loss: {val_loss:.4f}")
+
+                # Save Best Model
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    self.save_checkpoint('best_model.pt')
+                    print(f"[*] New best model saved (Loss: {best_val_loss:.4f})")
+
             # Save epoch checkpoint
             if epoch % self.args.save_epoch_every == 0:
                 self.save_checkpoint(f'epoch_{epoch:04d}.pt')
-            
-            # Sample generation (optional)
-            if epoch % self.args.sample_every == 0:
-                print(f"Generating samples at epoch {epoch}...")
-                sample_texts = ["a person walks forward", "a person jumps"]
-                sample_lengths = [120, 100]
-                samples = self.sample(sample_texts, sample_lengths, num_samples=2)
-                print(f"Generated samples shape: {samples.shape}")
-                # Save samples (add visualization code here)
         
         print("="*50)
-        print("Training completed!")
+        print(f"Training completed! Best Val Loss: {best_val_loss:.4f}")
         print("="*50)
     
     def save_checkpoint(self, filename):
@@ -332,7 +355,7 @@ class VQDiffusionTrainer:
         
         save_path = pjoin(self.args.model_dir, filename)
         torch.save(checkpoint, save_path)
-        print(f"Checkpoint saved to {save_path}")
+        # print(f"Checkpoint saved to {save_path}")
     
     def load_checkpoint(self, filename):
         """Load checkpoint"""
@@ -379,6 +402,12 @@ def main():
     parser.add_argument('--noise_schedule', type=str, default='cosine', choices=['linear', 'cosine'])
     parser.add_argument('--schedule_sampler', type=str, default='uniform')
     
+    # --- SAMPLER OPTIONS ---
+    parser.add_argument('--sampler', type=str, default='ddpm', choices=['ddpm', 'ddim'], 
+                        help='Sampler to use during evaluation/generation')
+    parser.add_argument('--ddim_eta', type=float, default=0.0, 
+                        help='DDIM eta (0.0 for deterministic, 1.0 for DDPM)')
+    
     # Training
     parser.add_argument('--max_epoch', type=int, default=100)
     parser.add_argument('--lr', type=float, default=2e-4)
@@ -389,7 +418,7 @@ def main():
     parser.add_argument('--log_every', type=int, default=50)
     parser.add_argument('--save_every', type=int, default=1000)
     parser.add_argument('--save_epoch_every', type=int, default=5)
-    parser.add_argument('--eval_every', type=int, default=1)
+    parser.add_argument('--eval_every', type=int, default=1, help='Validate every N epochs')
     parser.add_argument('--sample_every', type=int, default=10)
     
     # Paths
@@ -440,83 +469,59 @@ def main():
         args.motion_dir = pjoin(args.data_root, 'npy')
         args.text_dir = pjoin(args.data_root, 'txt')
         args.joints_num = 55
-        args.max_motion_length = 360  # ~6 seconds at 60fps
-        dim_pose = 264  # axis-angle for 55 joints
+        args.max_motion_length = 360 
+        dim_pose = 264 
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
     
-    # Load data
+    # Load data stats
     stats_file_path = "/home/serverai/ltdoanh/Motion_Diffusion/global_pipeline.pkl"
-    # print(f"[INFO] Loading pipeline from {stats_file_path} to extract stats...")
-
-    # Dùng joblib.load để đọc file pipeline đã lưu
     try:
         pipeline = joblib.load(stats_file_path)
-    except ModuleNotFoundError as e:
-        print(f"LỖI: Missing module. Bạn có quên 'import pymo' ở đầu file train không?")
-        print(f"Import pymo từ: {os.path.join(ROOT, 'datasets', 'pymo')}")
-        raise e
-
-    # Trích xuất 'mean' và 'std' từ bước 'stdscale' (ListStandardScaler)
-    try:
-        # 'stdscale' là tên bạn đặt trong step1_fit_scaler.py
         scaler = pipeline.named_steps['stdscale']
-        
         mean = scaler.data_mean_
         std = scaler.data_std_
-        
-        print("[INFO] Mean and Std extracted successfully from pipeline.")
-        
-    except KeyError:
-        print("LỖI: Không tìm thấy bước 'stdscale' trong pipeline. Tên bước có bị sai không?")
-        raise
-    except AttributeError:
-        print("LỖI: Bước 'stdscale' không có 'data_mean_'. Nó có phải là ListStandardScaler không?")
-        raise
+        print("[INFO] Mean and Std loaded successfully.")
+    except Exception as e:
+        print(f"Error loading stats: {e}")
+        raise e
 
-    # Đảm bảo chúng là numpy array (dù chúng vốn là vậy)
-    if not isinstance(mean, np.ndarray):
-        mean = np.array(mean)
-    if not isinstance(std, np.ndarray):
-        std = np.array(std)
-        
-    print("[INFO] Mean and Std loaded successfully from .pkl file.")
-    args.mean = mean
-    args.std = std
+    args.mean = np.array(mean)
+    args.std = np.array(std)
     
     train_split_file = pjoin(args.data_root, 'train.txt')
-    
-    # Create datasets
+    val_split_file = pjoin(args.data_root, 'val.txt')
+
+    # Create datasets options
     class DummyOpt:
         def __init__(self, args, is_train):
             self.motion_dir = args.motion_dir
             self.text_dir = args.text_dir
             self.max_motion_length = args.max_motion_length
             self.unit_length = 4
-            self.times = getattr(args, 'times', 1)  # For BEAT dataset
+            self.times = getattr(args, 'times', 1)
             self.dataset_name = args.dataset_name
             self.motion_rep = 'position'
             self.is_train = is_train
     
-    # dummy_opt = DummyOpt(args)
     train_opt = DummyOpt(args, is_train=True)
-    # val_opt = DummyOpt(args, is_train=False)
+    val_opt = DummyOpt(args, is_train=False)
     
-    # Select dataset class based on dataset_name
+    # Select dataset class
     if args.dataset_name in ['t2m', 'kit']:
-        # from data.t2m_dataset import Text2MotionDataset as DatasetClass
-        print("[INFO] Using Text2MotionDataset for T2M/KIT")
+        from data.t2m_dataset import Text2MotionDataset as DatasetClass
+        # Ensure dataset supports 'val' split loading if implementing validation for T2M/KIT
     elif args.dataset_name == 'beat':
         from datasets.dataset import Beat2MotionDataset as DatasetClass
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
     
-    # Auto-create train.txt for BEAT if not exists
+    # Auto-create splits for BEAT if needed
     if args.dataset_name == 'beat':
-        create_train_split(args.motion_dir, train_split_file)
+        create_split_files(args.motion_dir, train_split_file, val_split_file)
     
+    # Train Dataset
     train_dataset = DatasetClass(train_opt, mean, std, train_split_file, getattr(args, 'times', 1))
-    
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -526,7 +531,19 @@ def main():
         pin_memory=True
     )
     
+    # Val Dataset
+    val_dataset = DatasetClass(val_opt, mean, std, val_split_file, times=1)
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        drop_last=True,
+        pin_memory=True
+    )
+    
     print(f"Train dataset: {len(train_dataset)} samples")
+    print(f"Val dataset:   {len(val_dataset)} samples")
     
     # Create model
     model = create_vq_latent_diffusion(
@@ -543,13 +560,8 @@ def main():
         no_eff=args.no_eff
     )
     
-    print(f"Model parameters:")
-    print(f"  Total: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
-    print(f"  Trainable: {sum(p.numel() for p in model.parameters() if p.requires_grad)/1e6:.2f}M")
-    
     # Create diffusion process
     betas = get_named_beta_schedule(args.noise_schedule, args.diffusion_steps)
-    
     diffusion = GaussianDiffusion(
         betas=betas,
         model_mean_type=ModelMeanType.EPSILON,
@@ -558,22 +570,20 @@ def main():
         rescale_timesteps=False
     )
     
-    print(f"Diffusion steps: {diffusion.num_timesteps}")
-    
     # Create trainer
     trainer = VQDiffusionTrainer(
         args=args,
         model=model,
         diffusion=diffusion,
         data_loader=train_loader,
-        val_loader=None
+        val_loader=val_loader # Pass the val_loader here
     )
     
-    # Resume from checkpoint if specified
+    # Resume
     if args.resume is not None:
         trainer.load_checkpoint(args.resume)
     
-    # Start training
+    # Start
     trainer.train()
 
 

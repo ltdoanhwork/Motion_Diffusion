@@ -113,10 +113,10 @@ def main():
     parser.add_argument('--joints_num', type=int, default=55, help='Số khớp (55 cho BEAT)')
 
     # --- Training Params ---
-    parser.add_argument('--max_epoch', type=int, default=50, help='Số epoch tối đa')
+    parser.add_argument('--max_epoch', type=int, default=25, help='Số epoch tối đa')
     parser.add_argument('--batch_size', type=int, default=64, help='Batch size')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
-    parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay')
+    parser.add_argument('--weight_decay', type=float, default=0.01, help='Weight decay')
     parser.add_argument('--is_continue', action='store_true', help='Tiếp tục training từ checkpoint "latest.tar"')
     parser.add_argument('--num_workers', type=int, default=4, help='Số luồng tải data')
     
@@ -173,16 +173,20 @@ def main():
         print("Exiting.")
         sys.exit(1)
 
-    # --- 10. TẠO DATA LOADER ---
+    # --- 10. TẠO DATA LOADER (SỬA ĐỔI) ---
     train_split_file = pjoin(args.data_root, 'train.txt')
+    val_split_file = pjoin(args.data_root, 'val.txt')  # <--- THÊM MỚI: Định nghĩa file val
 
-    # Tự động tạo split nếu chưa có
+    # B1: Tự động tạo file train.txt (chứa tất cả) nếu chưa có
     create_train_split(args.motion_dir, train_split_file)
 
+    # B2: Tự động tách 10% từ train.txt sang val.txt nếu chưa có file val
+    # Hàm này sẽ ghi đè train.txt (ít đi) và tạo val.txt mới
+    create_val_split(train_split_file, val_split_file, val_ratio=0.1) # <--- THÊM MỚI
+
+    # --- Setup Train Loader ---
     train_opt = DummyOpt(args, is_train=True)
-
     train_dataset = DatasetClass(train_opt, mean, std, train_split_file)
-
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -191,24 +195,36 @@ def main():
         pin_memory=True,
         drop_last=True
     )
+
+    # --- Setup Validation Loader (THÊM MỚI) ---
+    print(f"[INFO] Loading Validation Dataset...")
+    val_opt = DummyOpt(args, is_train=False) # is_train=False để không shuffle/augment nếu dataset có logic đó
+    val_dataset = DatasetClass(val_opt, mean, std, val_split_file)
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False, # Validation không cần shuffle
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=False # Không cần drop last
+    )
     
     print(f"Train dataset: {len(train_dataset)} samples")
-    # print(f"Validation dataset: {len(val_dataset)} samples")
+    print(f"Validation dataset: {len(val_dataset)} samples") # <--- Log số lượng
 
     # --- 11. KHỞI TẠO MÔ HÌNH VQ-VAE ---
-    # Cập nhật các tham số cho RVQVAE từ 'args'
-    # (Vì RVQVAE cần 'args' để cấu hình ResidualVQ)
-    args.num_quantizers = args.num_codebooks  # Đổi tên cho nhất quán
-    args.shared_codebook = False # Giả định (bạn có thể thêm vào argparse nếu cần)
-    args.quantize_dropout_prob = 0.0 # Giả định
-    args.mu = 0.99  # <--- THÊM DÒNG NÀY (0.99 là giá trị EMA mặc định phổ biến)
+    # (Giữ nguyên code cũ của bạn)
+    args.num_quantizers = args.num_codebooks 
+    args.shared_codebook = False 
+    args.quantize_dropout_prob = 0.0 
+    args.mu = 0.99 
 
     model = RVQVAE(
-        args,  # <--- TRUYỀN TOÀN BỘ 'args' VÀO ĐÂY
-        input_width=args.dim_pose,  # <--- Sửa tên
-        nb_code=args.codebook_size,  # <--- Sửa tên
-        code_dim=args.codebook_dim,  # <--- Sửa tên
-        output_emb_width=args.codebook_dim, # Đảm bảo khớp với code_dim
+        args, 
+        input_width=args.dim_pose, 
+        nb_code=args.codebook_size, 
+        code_dim=args.codebook_dim, 
+        output_emb_width=args.codebook_dim, 
         down_t=3,
         stride_t=2,
         width=512,
@@ -221,14 +237,15 @@ def main():
     print(f"VQ-VAE Model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)/1e6:.2f}M")
 
     # --- 12. KHỞI TẠO TRAINER ---
-    # args (từ argparse) được truyền vào, trainer sẽ tự lấy các giá trị
     trainer = RVQTokenizerTrainer(args, model)  
 
-    # --- 13. HUẤN LUYỆN ---
+    # --- 13. HUẤN LUYỆN (SỬA ĐỔI) ---
     print("Starting VQ-VAE Training...")
+    
+    # Truyền val_loader vào đây
     trainer.train(
         train_loader, 
-        val_loader=None,
+        val_loader=val_loader, # <--- QUAN TRỌNG: Truyền val_loader vào
         eval_val_loader=None, 
         eval_wrapper=None, 
         plot_eval=None
