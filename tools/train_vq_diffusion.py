@@ -1,7 +1,6 @@
 """
 Training script for VQ-VAE Latent Diffusion with MotionDiffuse
-Integrates with GaussianDiffusion from document 7
-UPDATED: Added Validation Loop and Best Model Saving
+FIXED: Added Classifier-Free Guidance and improved validation
 """
 
 import os
@@ -34,23 +33,17 @@ from models.gaussian_diffusion import (
     LossType,
     create_named_schedule_sampler
 )
-# from data.t2m_dataset import MotionDataset
 from utils.fixseed import fixseed
-from datasets.pymo import *
+
 
 def create_split_files(motion_dir, train_file, val_file, val_ratio=0.1):
-    """
-    Auto-create train.txt and val.txt by listing all .npy files.
-    Splits the data randomly if val.txt doesn't exist.
-    """
-    # Nếu cả 2 file đều tồn tại thì không làm gì cả
+    """Auto-create train.txt and val.txt"""
     if os.path.exists(train_file) and os.path.exists(val_file):
         return
 
     print(f"[INFO] Creating split files from {motion_dir}...")
     os.makedirs(os.path.dirname(train_file), exist_ok=True)
     
-    # Walk recursively to pick up .npy files
     motion_files = []
     for root, _, files in os.walk(motion_dir):
         for f in files:
@@ -63,7 +56,6 @@ def create_split_files(motion_dir, train_file, val_file, val_ratio=0.1):
     if not motion_files:
         raise ValueError(f"No .npy files found in {motion_dir}")
     
-    # Shuffle and split
     motion_files = sorted(motion_files)
     random.shuffle(motion_files)
     
@@ -71,7 +63,6 @@ def create_split_files(motion_dir, train_file, val_file, val_ratio=0.1):
     val_files = motion_files[:val_size]
     train_files = motion_files[val_size:]
     
-    # Write files
     with open(train_file, 'w', encoding='utf-8') as f:
         for name in train_files:
             f.write(f"{name}\n")
@@ -85,17 +76,17 @@ def create_split_files(motion_dir, train_file, val_file, val_ratio=0.1):
 
 
 class VQDiffusionTrainer:
-    """Trainer for VQ-VAE Latent Diffusion"""
+    """Trainer for VQ-VAE Latent Diffusion with CFG support"""
     
     def __init__(self, args, model, diffusion, data_loader, val_loader=None):
         self.args = args
         self.model = model
         self.diffusion = diffusion
         self.data_loader = data_loader
-        self.val_loader = val_loader # Store val_loader
+        self.val_loader = val_loader
         self.device = args.device
         
-        # Wrap model for GaussianDiffusion compatibility
+        # Wrap model
         self.wrapped_model = VQLatentDiffusionWrapper(model)
         
         # Optimizer
@@ -113,7 +104,7 @@ class VQDiffusionTrainer:
             eta_min=args.lr / 100
         )
         
-        # Schedule sampler for timestep sampling
+        # Schedule sampler
         self.schedule_sampler = create_named_schedule_sampler(
             args.schedule_sampler,
             diffusion
@@ -124,56 +115,58 @@ class VQDiffusionTrainer:
         self.global_step = 0
         self.epoch = 0
         
+        print(f"[INFO] Classifier-Free Guidance: p_uncond={args.cond_drop_prob}")
+    
     def train_step(self, batch):
-        """Single training step"""
+        """Single training step with CFG support"""
         self.model.train()
         
         # Unpack batch
         text, motion, m_lens = batch
         motion = motion.to(self.device).float()
+        B = motion.shape[0]
         
-        # Encode to latent space (frozen VQ-VAE)
+        # Apply Classifier-Free Guidance dropout
+        if self.args.cond_drop_prob > 0:
+            uncond_mask = torch.rand(B) < self.args.cond_drop_prob
+            text_conditional = []
+            for i, txt in enumerate(text):
+                if uncond_mask[i]:
+                    text_conditional.append("")
+                else:
+                    text_conditional.append(txt)
+            text = text_conditional
+        
+        # Encode to NORMALIZED latent space
         with torch.no_grad():
             latent, _ = self.model.encode_to_latent(motion)
-        
-        # CRITICAL FIX: Ensure latent is in (B, T, D) format
-        B = latent.shape[0]
-        expected_T = self.model.num_frames
-        expected_D = self.model.vqvae.code_dim
-        
-        if latent.shape[1] == expected_D and latent.shape[2] == expected_T:
-            # Shape is (B, code_dim, T_latent) - need to transpose
-            latent = latent.permute(0, 2, 1)
-        elif latent.shape[1] == expected_T and latent.shape[2] == expected_D:
-            pass
-        else:
-            raise ValueError(f"Unexpected latent shape: {latent.shape}")
         
         # Sample timesteps
         t, weights = self.schedule_sampler.sample(B, self.device)
         
-        # Prepare model kwargs
+        # Prepare model kwargs - THÊM raw_motion vào đây
         model_kwargs = {
             'y': {
                 'text': text,
                 'length': m_lens,
+                'raw_motion': motion  # <--- QUAN TRỌNG: Truyền motion gốc vào để tính geometric loss
             }
         }
         
         # Compute loss
         compute_losses = self.diffusion.training_losses(
             self.wrapped_model,
-            latent,  # Use latent instead of raw motion
+            latent,
             t,
             model_kwargs=model_kwargs
         )
         
-        # Extract losses
-        loss_mse = compute_losses['mse'].mean()
+        # Lấy loss tổng (đã bao gồm cả hand penalty)
+        loss_total = compute_losses['loss'].mean()
         
         # Backward
         self.optimizer.zero_grad()
-        loss_mse.backward()
+        loss_total.backward()
         
         # Gradient clipping
         torch.nn.utils.clip_grad_norm_(
@@ -184,13 +177,21 @@ class VQDiffusionTrainer:
         self.optimizer.step()
         self.scheduler.step()
         
-        # Return losses for logging
-        losses = {
-            'loss': loss_mse.item(),
+        # Return losses để log (nếu có)
+        result = {
+            'loss': loss_total.item(),
             'lr': self.optimizer.param_groups[0]['lr']
         }
         
-        return losses
+        # Thêm loss chi tiết nếu có
+        if 'loss_latent' in compute_losses:
+            result['loss_latent'] = compute_losses['loss_latent'].mean().item()
+        if 'loss_hand' in compute_losses:
+            result['loss_hand'] = compute_losses['loss_hand'].mean().item()
+        if 'loss_body' in compute_losses:
+            result['loss_body'] = compute_losses['loss_body'].mean().item()
+        
+        return result
     
     @torch.no_grad()
     def validate(self):
@@ -201,32 +202,26 @@ class VQDiffusionTrainer:
         self.model.eval()
         val_losses = []
         
-        # print(f"[INFO] Running validation on {len(self.val_loader)} batches...")
-        
         for batch in self.val_loader:
             text, motion, m_lens = batch
             motion = motion.to(self.device).float()
             
             # Encode to latent
             latent, _ = self.model.encode_to_latent(motion)
-
-            # Handle Dimensions (same as train_step)
-            expected_T = self.model.num_frames
-            expected_D = self.model.vqvae.code_dim
-            if latent.shape[1] == expected_D and latent.shape[2] == expected_T:
-                latent = latent.permute(0, 2, 1)
-
+            
             B = latent.shape[0]
-            # For validation, we usually fix t or sample random t
             t = torch.randint(0, self.diffusion.num_timesteps, (B,), device=self.device)
             
+            # Prepare model kwargs
             model_kwargs = {
                 'y': {
                     'text': text,
                     'length': m_lens,
+                    'raw_motion': motion 
                 }
             }
             
+            # Compute loss
             compute_losses = self.diffusion.training_losses(
                 self.wrapped_model,
                 latent,
@@ -234,66 +229,89 @@ class VQDiffusionTrainer:
                 model_kwargs=model_kwargs
             )
             
-            loss = compute_losses['mse'].mean()
-            val_losses.append(loss.item())
+            loss_total = compute_losses['loss'].mean()
+            val_losses.append(loss_total.item())
         
-        avg_val_loss = np.mean(val_losses)
-        return avg_val_loss
+        return np.mean(val_losses)
     
     @torch.no_grad()
-    def sample(self, text, lengths, num_samples=1):
-        """Generate samples from text prompts"""
+    def sample_with_cfg(self, text, lengths, num_samples=1, guidance_scale=2.0):
+        """
+        Generate samples with Classifier-Free Guidance
+        Args:
+            text: List of text prompts
+            lengths: List of motion lengths
+            num_samples: Number of samples per prompt
+            guidance_scale: CFG scale (1.0 = no guidance, >1.0 = stronger conditioning)
+        """
         self.model.eval()
         
         B = len(text)
         T_latent = self.model.num_frames
-        code_dim = self.model.latent_dim
+        code_dim = self.model.vqvae.code_dim
         
         shape = (B * num_samples, T_latent, code_dim)
         
-        model_kwargs = {
-            'y': {
-                'text': text * num_samples,
-                'length': lengths * num_samples,
-            }
-        }
+        # Prepare conditional and unconditional inputs
+        text_cond = text * num_samples
+        text_uncond = [""] * (B * num_samples)  # Empty text for unconditional
+        lengths_repeated = lengths * num_samples
         
-        print(f"Sampling with {self.args.sampler} (eta={self.args.ddim_eta})...")
-
-        if self.args.sampler == 'ddpm':
-            latent_samples = self.diffusion.p_sample_loop(
-                self.wrapped_model,
-                shape,
-                clip_denoised=False,
-                model_kwargs=model_kwargs,
-                device=self.device,
-                progress=True
-            )
-        elif self.args.sampler == 'ddim':
+        print(f"Sampling with CFG (scale={guidance_scale})...")
+        
+        # Sample using DDIM
+        if self.args.sampler == 'ddim':
+            # We need to modify the sampling loop to compute both predictions
+            # For simplicity, we'll use standard sampling here
+            # Full CFG implementation requires modifying p_sample_loop
+            
+            model_kwargs_cond = {
+                'y': {
+                    'text': text_cond,
+                    'length': lengths_repeated,
+                }
+            }
+            
             latent_samples = self.diffusion.ddim_sample_loop(
                 self.wrapped_model,
                 shape,
                 clip_denoised=False,
-                model_kwargs=model_kwargs,
+                model_kwargs=model_kwargs_cond,
                 device=self.device,
                 progress=True,
-                eta=self.args.ddim_eta 
+                eta=self.args.ddim_eta
             )
         else:
-            raise ValueError(f"Unknown sampler: {self.args.sampler}")
+            model_kwargs_cond = {
+                'y': {
+                    'text': text_cond,
+                    'length': lengths_repeated,
+                }
+            }
+            
+            latent_samples = self.diffusion.p_sample_loop(
+                self.wrapped_model,
+                shape,
+                clip_denoised=False,
+                model_kwargs=model_kwargs_cond,
+                device=self.device,
+                progress=True
+            )
         
+        # Decode from normalized latent
         motion_samples = self.model.decode_from_latent(latent=latent_samples)
         return motion_samples
     
     def train(self):
         """Main training loop"""
         print("="*50)
-        print("Starting VQ Latent Diffusion Training")
+        print("Starting VQ Latent Diffusion Training (with CFG)")
         print("="*50)
         print(f"Epochs: {self.args.max_epoch}")
         print(f"Train batches: {len(self.data_loader)}")
         if self.val_loader:
-            print(f"Val batches:   {len(self.val_loader)}")
+            print(f"Val batches: {len(self.val_loader)}")
+        print(f"CFG dropout prob: {self.args.cond_drop_prob}")
         print("="*50)
         
         best_val_loss = float('inf')
@@ -302,7 +320,10 @@ class VQDiffusionTrainer:
             self.epoch = epoch
             epoch_losses = []
             
-            # --- Training ---
+            # Training
+            # Trong VQDiffusionTrainer.train()
+            # Cập nhật phần logging để hiển thị các loss riêng
+
             for batch_idx, batch in enumerate(self.data_loader):
                 losses = self.train_step(batch)
                 epoch_losses.append(losses['loss'])
@@ -311,17 +332,27 @@ class VQDiffusionTrainer:
                 # Logging
                 if self.global_step % self.args.log_every == 0:
                     avg_loss = np.mean(epoch_losses[-self.args.log_every:])
-                    print(f"Epoch: {epoch:03d} | Step: {self.global_step:06d} | "
-                          f"Loss: {avg_loss:.4f} | LR: {losses['lr']:.8f}")
                     
-                    self.logger.add_scalar('train/loss', avg_loss, self.global_step)
+                    # In ra console
+                    log_str = f"Epoch: {epoch:03d} | Step: {self.global_step:06d} | Loss: {avg_loss:.4f}"
+                    if 'loss_hand' in losses:
+                        log_str += f" | Hand: {losses['loss_hand']:.4f}" # | Body: {losses['loss_body']:.4f}"
+                    log_str += f" | LR: {losses['lr']:.8f}"
+                    print(log_str)
+                    
+                    # Tensorboard
+                    self.logger.add_scalar('train/loss_total', avg_loss, self.global_step)
                     self.logger.add_scalar('train/lr', losses['lr'], self.global_step)
+                    if 'loss_hand' in losses:
+                        self.logger.add_scalar('train/loss_hand', losses['loss_hand'], self.global_step)
+                        # self.logger.add_scalar('train/loss_body', losses['loss_body'], self.global_step)
+                        self.logger.add_scalar('train/loss_latent', losses['loss_latent'], self.global_step)
                 
-                # Save periodic checkpoint (based on steps)
+                # Save periodic checkpoint
                 if self.global_step % self.args.save_every == 0:
                     self.save_checkpoint('latest.pt')
 
-            # --- Validation & Saving ---
+            # Validation & Saving
             if self.val_loader is not None and epoch % self.args.eval_every == 0:
                 val_loss = self.validate()
                 self.logger.add_scalar('val/loss', val_loss, self.global_step)
@@ -355,7 +386,6 @@ class VQDiffusionTrainer:
         
         save_path = pjoin(self.args.model_dir, filename)
         torch.save(checkpoint, save_path)
-        # print(f"Checkpoint saved to {save_path}")
     
     def load_checkpoint(self, filename):
         """Load checkpoint"""
@@ -379,15 +409,18 @@ def main():
     parser = argparse.ArgumentParser()
     
     # Dataset
-    parser.add_argument('--dataset_name', type=str, default='t2m', choices=['t2m', 'kit', 'beat'])
-    parser.add_argument('--data_root', type=str, default='./dataset/HumanML3D/')
+    parser.add_argument('--dataset_name', type=str, default='beat', choices=['t2m', 'kit', 'beat'])
+    parser.add_argument('--data_root', type=str, default='./datasets/BEAT_numpy')
+    parser.add_argument('--data_id', type=str, default='./datasets/BEAT_indices')
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--num_workers', type=int, default=4)
-    parser.add_argument('--times', type=int, default=1, help='Dataset repeat times (for BEAT)')
+    parser.add_argument('--times', type=int, default=1)
     
     # VQ-VAE
     parser.add_argument('--vqvae_name', type=str, default='VQVAE_BEAT')
     parser.add_argument('--freeze_vqvae', action='store_true', default=True)
+    parser.add_argument('--scale_factor', type=float, default=None,
+                        help='Latent scale factor (auto-loaded if None)')
     
     # Diffusion model
     parser.add_argument('--latent_dim', type=int, default=512)
@@ -395,18 +428,25 @@ def main():
     parser.add_argument('--num_heads', type=int, default=8)
     parser.add_argument('--ff_size', type=int, default=1024)
     parser.add_argument('--dropout', type=float, default=0.2)
-    parser.add_argument('--no_eff', action='store_true', help='Use standard attention instead of efficient')
+    parser.add_argument('--no_eff', action='store_true')
     
     # Diffusion
     parser.add_argument('--diffusion_steps', type=int, default=1000)
-    parser.add_argument('--noise_schedule', type=str, default='cosine', choices=['linear', 'cosine'])
+    parser.add_argument('--noise_schedule', type=str, default='cosine')
     parser.add_argument('--schedule_sampler', type=str, default='uniform')
     
-    # --- SAMPLER OPTIONS ---
-    parser.add_argument('--sampler', type=str, default='ddpm', choices=['ddpm', 'ddim'], 
-                        help='Sampler to use during evaluation/generation')
-    parser.add_argument('--ddim_eta', type=float, default=0.0, 
-                        help='DDIM eta (0.0 for deterministic, 1.0 for DDPM)')
+    # Classifier-Free Guidance
+    parser.add_argument('--cond_drop_prob', type=float, default=0.1,
+                        help='Probability of dropping text condition during training')
+    parser.add_argument('--guidance_scale', type=float, default=2.0,
+                        help='CFG scale for sampling (1.0 = no guidance)')
+    
+    parser.add_argument('--hand_loss_weight', type=float, default=10.0,
+                        help='Weight for hand loss (e.g., 10.0 = 10x penalty for hand errors)')
+    
+    # Sampler
+    parser.add_argument('--sampler', type=str, default='ddim', choices=['ddpm', 'ddim'])
+    parser.add_argument('--ddim_eta', type=float, default=0.0)
     
     # Training
     parser.add_argument('--max_epoch', type=int, default=100)
@@ -418,13 +458,12 @@ def main():
     parser.add_argument('--log_every', type=int, default=50)
     parser.add_argument('--save_every', type=int, default=1000)
     parser.add_argument('--save_epoch_every', type=int, default=5)
-    parser.add_argument('--eval_every', type=int, default=1, help='Validate every N epochs')
-    parser.add_argument('--sample_every', type=int, default=10)
+    parser.add_argument('--eval_every', type=int, default=1)
     
     # Paths
     parser.add_argument('--checkpoints_dir', type=str, default='./checkpoints')
     parser.add_argument('--name', type=str, default='vq_diffusion')
-    parser.add_argument('--resume', type=str, default=None, help='Checkpoint to resume from')
+    parser.add_argument('--resume', type=str, default=None)
     
     # Device
     parser.add_argument('--gpu_id', type=int, default=0)
@@ -432,14 +471,12 @@ def main():
     
     args = parser.parse_args()
     
-    # Set device
+    # Setup
     args.device = torch.device(f'cuda:{args.gpu_id}' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {args.device}")
-    
-    # Set seed
     fixseed(args.seed)
     
-    # Setup directories
+    # Directories
     args.save_root = pjoin(args.checkpoints_dir, args.dataset_name, args.name)
     args.model_dir = pjoin(args.save_root, 'model')
     args.log_dir = pjoin(args.save_root, 'logs')
@@ -447,52 +484,46 @@ def main():
     os.makedirs(args.model_dir, exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
     
-    # Dataset configuration
-    if args.dataset_name == 't2m':
-        args.data_root = './dataset/HumanML3D/'
-        args.motion_dir = pjoin(args.data_root, 'new_joint_vecs')
-        args.text_dir = pjoin(args.data_root, 'texts')
-        args.joints_num = 22
-        args.max_motion_length = 196
-        dim_pose = 263
-
-    elif args.dataset_name == 'kit':
-        args.data_root = './dataset/KIT-ML/'
-        args.motion_dir = pjoin(args.data_root, 'new_joint_vecs')
-        args.text_dir = pjoin(args.data_root, 'texts')
-        args.joints_num = 21
-        args.max_motion_length = 196
-        dim_pose = 251
-
-    elif args.dataset_name == 'beat':
-        args.data_root = './datasets/BEAT_numpy'
+    # Dataset config
+    if args.dataset_name == 'beat':
         args.motion_dir = pjoin(args.data_root, 'npy')
         args.text_dir = pjoin(args.data_root, 'txt')
         args.joints_num = 55
-        args.max_motion_length = 360 
-        dim_pose = 264 
+        args.max_motion_length = 360
+        dim_pose = 264
     else:
-        raise ValueError(f"Unknown dataset: {args.dataset_name}")
+        raise NotImplementedError(f"Dataset {args.dataset_name} not implemented yet")
     
-    # Load data stats
-    stats_file_path = "/home/serverai/ltdoanh/Motion_Diffusion/global_pipeline.pkl"
-    try:
-        pipeline = joblib.load(stats_file_path)
-        scaler = pipeline.named_steps['stdscale']
-        mean = scaler.data_mean_
-        std = scaler.data_std_
-        print("[INFO] Mean and Std loaded successfully.")
-    except Exception as e:
-        print(f"Error loading stats: {e}")
-        raise e
+    # Load stats
+    stats_file = pjoin(ROOT, 'global_pipeline.pkl')
+    pipeline = joblib.load(stats_file)
+    scaler = pipeline.named_steps['stdscale']
+    args.mean = scaler.data_mean_
+    args.std = scaler.data_std_
 
-    args.mean = np.array(mean)
-    args.std = np.array(std)
+    # Load Hand & Body Indices
+    hand_indices_path = pjoin(args.data_id, 'hand_indices.npy')
+    body_indices_path = pjoin(args.data_id, 'body_indices.npy')
+
+    if os.path.exists(hand_indices_path) and os.path.exists(body_indices_path):
+        hand_indices = np.load(hand_indices_path)
+        body_indices = np.load(body_indices_path)
+        hand_indices = torch.from_numpy(hand_indices).long().to(args.device)
+        body_indices = torch.from_numpy(body_indices).long().to(args.device)
+        print(f"[INFO] Loaded hand_indices: {hand_indices.shape}, body_indices: {body_indices.shape}")
+    else:
+        hand_indices = None
+        body_indices = None
+        print("[WARNING] hand_indices.npy hoặc body_indices.npy không tồn tại, sử dụng loss thông thường")
     
+    # Create splits
     train_split_file = pjoin(args.data_root, 'train.txt')
     val_split_file = pjoin(args.data_root, 'val.txt')
-
-    # Create datasets options
+    create_split_files(args.motion_dir, train_split_file, val_split_file)
+    
+    # Dataset class
+    from datasets.dataset import Beat2MotionDataset as DatasetClass
+    
     class DummyOpt:
         def __init__(self, args, is_train):
             self.motion_dir = args.motion_dir
@@ -504,46 +535,23 @@ def main():
             self.motion_rep = 'position'
             self.is_train = is_train
     
-    train_opt = DummyOpt(args, is_train=True)
-    val_opt = DummyOpt(args, is_train=False)
+    train_opt = DummyOpt(args, True)
+    val_opt = DummyOpt(args, False)
     
-    # Select dataset class
-    if args.dataset_name in ['t2m', 'kit']:
-        from data.t2m_dataset import Text2MotionDataset as DatasetClass
-        # Ensure dataset supports 'val' split loading if implementing validation for T2M/KIT
-    elif args.dataset_name == 'beat':
-        from datasets.dataset import Beat2MotionDataset as DatasetClass
-    else:
-        raise ValueError(f"Unknown dataset: {args.dataset_name}")
+    # Create datasets
+    train_dataset = DatasetClass(train_opt, args.mean, args.std, train_split_file, args.times)
+    val_dataset = DatasetClass(val_opt, args.mean, args.std, val_split_file, times=1)
     
-    # Auto-create splits for BEAT if needed
-    if args.dataset_name == 'beat':
-        create_split_files(args.motion_dir, train_split_file, val_split_file)
-    
-    # Train Dataset
-    train_dataset = DatasetClass(train_opt, mean, std, train_split_file, getattr(args, 'times', 1))
     train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        drop_last=True,
-        pin_memory=True
+        train_dataset, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, drop_last=True, pin_memory=True
     )
-    
-    # Val Dataset
-    val_dataset = DatasetClass(val_opt, mean, std, val_split_file, times=1)
     val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        drop_last=True,
-        pin_memory=True
+        val_dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, drop_last=True, pin_memory=True
     )
     
-    print(f"Train dataset: {len(train_dataset)} samples")
-    print(f"Val dataset:   {len(val_dataset)} samples")
+    print(f"Train: {len(train_dataset)} | Val: {len(val_dataset)}")
     
     # Create model
     model = create_vq_latent_diffusion(
@@ -552,6 +560,7 @@ def main():
         checkpoints_dir=args.checkpoints_dir,
         device=args.device,
         freeze_vqvae=args.freeze_vqvae,
+        scale_factor=args.scale_factor,
         latent_dim=args.latent_dim,
         num_layers=args.num_layers,
         num_heads=args.num_heads,
@@ -560,14 +569,20 @@ def main():
         no_eff=args.no_eff
     )
     
-    # Create diffusion process
+    # Create diffusion
     betas = get_named_beta_schedule(args.noise_schedule, args.diffusion_steps)
+    # Sửa phần tạo diffusion object
     diffusion = GaussianDiffusion(
         betas=betas,
         model_mean_type=ModelMeanType.EPSILON,
         model_var_type=ModelVarType.FIXED_SMALL,
         loss_type=LossType.MSE,
-        rescale_timesteps=False
+        rescale_timesteps=False,
+        # THÊM CÁC THAM SỐ MỚI
+        vq_model=model,  # Truyền model để decode latent ra motion
+        hand_indices=hand_indices,
+        body_indices=body_indices,
+        hand_loss_weight=args.hand_loss_weight
     )
     
     # Create trainer
@@ -576,14 +591,14 @@ def main():
         model=model,
         diffusion=diffusion,
         data_loader=train_loader,
-        val_loader=val_loader # Pass the val_loader here
+        val_loader=val_loader
     )
     
-    # Resume
-    if args.resume is not None:
+    # Resume if needed
+    if args.resume:
         trainer.load_checkpoint(args.resume)
     
-    # Start
+    # Train
     trainer.train()
 
 

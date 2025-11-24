@@ -1,10 +1,5 @@
-import os
-import sys
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
-
 import random
+
 import torch.nn as nn
 from models.vq.encdec import Encoder, Decoder
 from models.vq.residual_vq import ResidualVQ
@@ -73,7 +68,8 @@ class RVQVAE(nn.Module):
 
         ## quantization
         # x_quantized, code_idx, commit_loss, perplexity = self.quantizer(x_encoder, sample_codebook_temp=0.5,
-        #                                                                 force_dropout_index=0) #TODO hardcode
+        #                                                                 force_dropout_index=0) 
+        # #TODO hardcode
         x_quantized, code_idx, commit_loss, perplexity = self.quantizer(x_encoder, sample_codebook_temp=0.5)
 
         # print(code_idx[0, :, 1])

@@ -1,6 +1,6 @@
 """
 VQ-VAE Latent Diffusion Model for Motion Generation
-Integrates VQ-VAE encoder/decoder with MotionTransformer
+FIXED: Added proper latent scaling for Gaussian diffusion compatibility
 """
 import os
 import sys
@@ -17,7 +17,7 @@ from models.transformer import MotionTransformer
 
 class VQLatentDiffusion(nn.Module):
     """
-    Latent Diffusion Model that works in VQ-VAE latent space
+    Latent Diffusion Model with proper scaling for VQ-VAE latent space
     """
     def __init__(
         self,
@@ -25,9 +25,11 @@ class VQLatentDiffusion(nn.Module):
         vqvae_config,
         vqvae_checkpoint=None,
         freeze_vqvae=True,
+        # Latent scaling (CRITICAL FIX)
+        scale_factor=1.0,
         # Diffusion transformer parameters
         latent_dim=512,
-        num_frames=60,  # This is latent sequence length (original_frames // down_t^2)
+        num_frames=60,
         ff_size=1024,
         num_layers=8,
         num_heads=8,
@@ -40,16 +42,17 @@ class VQLatentDiffusion(nn.Module):
         text_num_heads=4,
         no_clip=False,
         no_eff=False,
-        # Training mode
-        use_continuous_latent=True,  # If True, use continuous latent; else use discrete codes
         **kwargs
     ):
         super().__init__()
         
         self.latent_dim = latent_dim
         self.num_frames = num_frames
-        self.use_continuous_latent = use_continuous_latent
         self.freeze_vqvae = freeze_vqvae
+        
+        # CRITICAL: Scale factor to normalize latent distribution
+        self.scale_factor = scale_factor
+        print(f"[INFO] Using scale_factor={scale_factor:.6f} for latent normalization")
         
         # Initialize VQ-VAE
         self.vqvae = RVQVAE(**vqvae_config)
@@ -71,12 +74,10 @@ class VQLatentDiffusion(nn.Module):
             self.vqvae.eval()
             print("VQ-VAE frozen")
         
-        # Calculate input features for transformer
-        # For continuous latent: code_dim
-        # For discrete codes: code_dim (after embedding lookup)
+        # Input features for transformer
         input_feats = vqvae_config['code_dim']
         
-        # Initialize Motion Transformer to work on latent space
+        # Initialize Motion Transformer
         self.transformer = MotionTransformer(
             input_feats=input_feats,
             num_frames=num_frames,
@@ -95,19 +96,19 @@ class VQLatentDiffusion(nn.Module):
         )
         
         print(f"VQLatentDiffusion initialized:")
-        print(f"  - Input features (latent): {input_feats}")
-        print(f"  - Latent sequence length: {num_frames}")
+        print(f"  - Input features: {input_feats}")
+        print(f"  - Latent seq length: {num_frames}")
         print(f"  - Transformer latent dim: {latent_dim}")
-        print(f"  - Use continuous latent: {use_continuous_latent}")
+        print(f"  - Scale factor: {scale_factor:.6f}")
     
     @torch.no_grad()
     def encode_to_latent(self, motion):
         """
-        Encode motion to latent space using VQ-VAE
+        Encode motion to NORMALIZED latent space
         Args:
             motion: (B, T, D) raw motion data
         Returns:
-            latent: (B, T_latent, code_dim) continuous latent representation
+            latent: (B, T_latent, code_dim) normalized latent (mean~0, std~1)
             code_idx: (B, T_latent, num_quantizers) discrete code indices
         """
         if self.freeze_vqvae:
@@ -115,36 +116,31 @@ class VQLatentDiffusion(nn.Module):
         
         # Encode motion
         code_idx, all_codes = self.vqvae.encode(motion)
-        # code_idx: (B, T_latent, Q)
         # all_codes: (Q, B, T_latent, code_dim)
         
-        # Sum over quantizers to get continuous representation
+        # Sum over quantizers
         latent = all_codes.sum(dim=0)  # (B, T_latent, code_dim)
         
-        # CRITICAL: Verify and fix shape
-        # Expected: (B, T_latent, code_dim)
-        B = latent.shape[0]
+        # Transpose to (B, T, D)
+        latent = latent.permute(0, 2, 1)  # (B, T_latent, code_dim)
         
-        # Check if latent needs transposing
-        # if latent.shape[1] == self.vqvae.code_dim and latent.shape[2] == self.num_frames:
-        #     # Shape is (B, code_dim, T_latent) - need to transpose
-        #     print(f"[DEBUG encode_to_latent] Transposing from {latent.shape} (B,D,T) to (B,T,D)")
-        latent = latent.permute(0, 2, 1)  # (B, D, T) -> (B, T, D)
+        # CRITICAL FIX: Scale latent to have std ~ 1.0
+        # This makes it compatible with Gaussian diffusion noise
+        latent_normalized = latent * self.scale_factor
         
-        # Final verification
-        assert latent.shape == (B, self.num_frames, self.vqvae.code_dim), \
-            f"encode_to_latent output shape mismatch: got {latent.shape}, expected ({B}, {self.num_frames}, {self.vqvae.code_dim})"
+        # Verify shape
+        B = latent_normalized.shape[0]
+        assert latent_normalized.shape == (B, self.num_frames, self.vqvae.code_dim), \
+            f"Latent shape mismatch: {latent_normalized.shape} vs ({B}, {self.num_frames}, {self.vqvae.code_dim})"
         
-        # print(f"[DEBUG encode_to_latent] Final latent shape: {latent.shape}")
-        
-        return latent, code_idx
+        return latent_normalized, code_idx
     
-    @torch.no_grad()
+    # @torch.no_grad()
     def decode_from_latent(self, latent=None, code_idx=None):
         """
-        Decode latent back to motion space using VQ-VAE decoder
+        Decode NORMALIZED latent back to motion space
         Args:
-            latent: (B, T_latent, code_dim) continuous latent
+            latent: (B, T_latent, code_dim) normalized latent from diffusion
             code_idx: (B, T_latent, Q) discrete code indices
         Returns:
             motion: (B, T, D) reconstructed motion
@@ -156,33 +152,32 @@ class VQLatentDiffusion(nn.Module):
             # Use discrete codes
             motion = self.vqvae.forward_decoder(code_idx)
         else:
-            # Use continuous latent
-            # Reshape for decoder: (B, T_latent, code_dim) -> (B, code_dim, T_latent)
-            latent_transposed = latent.permute(0, 2, 1)
+            # CRITICAL FIX: Rescale latent back to original magnitude
+            latent_rescaled = latent / self.scale_factor
+            
+            # Transpose for decoder: (B, T_latent, code_dim) -> (B, code_dim, T_latent)
+            latent_transposed = latent_rescaled.permute(0, 2, 1)
             motion = self.vqvae.decoder(latent_transposed)
         
         return motion
     
     def forward(self, x, timesteps, y=None, **kwargs): 
         """
-        Forward pass for training ...
+        Forward pass for training
+        x should already be in normalized latent space
         """
-
-        
-        # Tìm trong y trước, nếu không thấy hoặc y là None thì tìm trong kwargs
+        # Extract conditioning
         text = None
         length = None
         xf_proj = None
         xf_out = None
 
-        # 1. Thử lấy từ y (nếu y là dict)
         if y is not None:
             text = y.get('text', None)
             length = y.get('length', None)
             xf_proj = y.get('xf_proj', None)
             xf_out = y.get('xf_out', None)
         
-        # 2. Nếu chưa có (do y=None hoặc key không tồn tại), thử lấy từ kwargs
         if text is None:
             text = kwargs.get('text', None)
         if length is None:
@@ -191,15 +186,16 @@ class VQLatentDiffusion(nn.Module):
             xf_proj = kwargs.get('xf_proj', None)
         if xf_out is None:
             xf_out = kwargs.get('xf_out', None)
-        # ---------------------------------
         
         # Check if input is already in latent space
-        if x.shape[-1] == self.vqvae.code_dim and x.shape[1] < 200:
+        if x.shape[-1] == self.vqvae.code_dim and x.shape[1] == self.num_frames:
             latent = x
         else:
+            # Encode if raw motion (shouldn't happen during training)
             with torch.no_grad():
                 latent, _ = self.encode_to_latent(x)
 
+        # Predict noise/x_0 in latent space
         output = self.transformer(
             latent, 
             timesteps, 
@@ -207,52 +203,14 @@ class VQLatentDiffusion(nn.Module):
             text=text,
             xf_proj=xf_proj,
             xf_out=xf_out
-            )
-        
-        return output
-    
-    def forward_with_reconstruction(self, x, timesteps, length=None, text=None):
-        """
-        Forward pass with full reconstruction (for evaluation)
-        Args:
-            x: (B, T_original, D) raw motion
-            timesteps: (B,) diffusion timesteps
-            length: List of sequence lengths
-            text: List of text descriptions
-        Returns:
-            pred_latent: (B, T_latent, code_dim) predicted latent
-            recon_motion: (B, T_original, D) reconstructed motion
-            original_latent: (B, T_latent, code_dim) original latent
-        """
-        # Encode to latent
-        with torch.no_grad():
-            original_latent, code_idx = self.encode_to_latent(x)
-        
-        # Predict in latent space
-        pred_latent = self.forward(
-            original_latent, 
-            timesteps, 
-            length=length, 
-            text=text
         )
         
-        # Decode back to motion space
-        with torch.no_grad():
-            recon_motion = self.decode_from_latent(latent=pred_latent)
-        
-        return pred_latent, recon_motion, original_latent
+        return output
 
 
 class VQLatentDiffusionWrapper(nn.Module):
     """
-    Wrapper for training VQ Latent Diffusion with GaussianDiffusion.
-    
-    Key insight: During training, the flow is:
-    1. Raw motion (B, T_orig, D) -> VQ encode -> latent (B, T_latent, code_dim)  
-    2. GaussianDiffusion adds noise: latent -> x_t (noisy latent)
-    3. Model predicts: x_t -> predicted noise/x_0 in latent space
-    
-    This wrapper must handle the latent space directly (no re-encoding).
+    Wrapper for training VQ Latent Diffusion with GaussianDiffusion
     """
     def __init__(self, vq_diffusion_model):
         super().__init__()
@@ -261,13 +219,13 @@ class VQLatentDiffusionWrapper(nn.Module):
     def forward(self, x, timesteps, **kwargs):
         """
         Args:
-            x: (B, T_latent, code_dim) - noisy latent from GaussianDiffusion.q_sample()
+            x: (B, T_latent, code_dim) - normalized noisy latent from GaussianDiffusion
             timesteps: (B,) diffusion timesteps  
             **kwargs: Contains 'y' dict with text, length, etc.
         Returns:
             output: (B, T_latent, code_dim) - predicted in latent space
         """
-        # Extract conditioning from kwargs
+        # Extract conditioning
         y_dict = kwargs.get('y', {})
         text = y_dict.get('text', None)
         length = y_dict.get('length', None)
@@ -275,29 +233,27 @@ class VQLatentDiffusionWrapper(nn.Module):
         xf_out = y_dict.get('xf_out', None)
         
         # Validate input shape
-        assert x.dim() == 3, f"Expected 3D input (B, T, D), got shape {x.shape}"
+        assert x.dim() == 3, f"Expected 3D input (B, T, D), got {x.shape}"
         B, T, D = x.shape
         
-        # CRITICAL: Ensure dimensions match what transformer expects
-        # Transformer expects (B, num_frames, input_feats)
-        # We have (B, T_latent, code_dim) which should match
+        # Verify dimensions
         assert T == self.model.num_frames, \
-            f"Sequence length mismatch: got T={T}, expected {self.model.num_frames}"
+            f"Sequence length mismatch: {T} vs {self.model.num_frames}"
         assert D == self.model.vqvae.code_dim, \
-            f"Feature dim mismatch: got D={D}, expected code_dim={self.model.vqvae.code_dim}"
-                
-        # x is already in latent space with correct shape (B, T_latent, code_dim)
-        # Apply transformer to predict noise/x_0 in latent space  
+            f"Feature dim mismatch: {D} vs {self.model.vqvae.code_dim}"
+        
+        # x is already normalized latent, apply transformer
         output = self.model.transformer(
-            x,  # (B, T_latent=45, code_dim=512)
-            timesteps,  # (B,)
+            x,
+            timesteps,
             length=length,
             text=text,
             xf_proj=xf_proj,
             xf_out=xf_out
         )
-                
+        
         return output
+
 
 def create_vq_latent_diffusion(
     dataset_name='beat',
@@ -305,21 +261,11 @@ def create_vq_latent_diffusion(
     checkpoints_dir='./checkpoints',
     device='cuda',
     freeze_vqvae=True,
+    scale_factor=None,  # NEW: Allow passing scale_factor
     **diffusion_kwargs
 ):
     """
-    Factory function to create VQLatentDiffusion model
-    
-    Args:
-        dataset_name: 't2m', 'kit', or 'beat'
-        vqvae_name: Name of trained VQ-VAE checkpoint
-        checkpoints_dir: Directory containing checkpoints
-        device: Device to load model
-        freeze_vqvae: Whether to freeze VQ-VAE weights
-        **diffusion_kwargs: Additional arguments for transformer
-    
-    Returns:
-        model: VQLatentDiffusion model
+    Factory function to create VQLatentDiffusion model with proper scaling
     """
     import os
     from os.path import join as pjoin
@@ -334,14 +280,13 @@ def create_vq_latent_diffusion(
         down_t = 2
         num_frames_original = 196
     elif dataset_name == 'beat':
-        dim_pose = 264  # axis-angle for 55 joints
+        dim_pose = 264
         down_t = 3
-        num_frames_original = 360  # ~6 seconds at 60fps
+        num_frames_original = 360
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
     
     # Calculate latent sequence length
-    # With down_t=2 and stride_t=2, we downsample by 2^down_t = 4
     num_frames_latent = num_frames_original // (2 ** down_t)
     
     # VQ-VAE configuration
@@ -378,6 +323,25 @@ def create_vq_latent_diffusion(
         print(f"Warning: VQ-VAE checkpoint not found at {vqvae_checkpoint}")
         vqvae_checkpoint = None
     
+    # CRITICAL: Load scale_factor if not provided
+    if scale_factor is None:
+        scale_factor_file = pjoin(checkpoints_dir, dataset_name, vqvae_name, 'scale_factor.txt')
+        if os.path.exists(scale_factor_file):
+            with open(scale_factor_file, 'r') as f:
+                for line in f:
+                    if line.startswith('scale_factor='):
+                        scale_factor = float(line.split('=')[1].strip())
+                        print(f"[INFO] Loaded scale_factor={scale_factor:.6f} from {scale_factor_file}")
+                        break
+        
+        if scale_factor is None:
+            print("="*70)
+            print("WARNING: scale_factor not found!")
+            print("Please run: python calculate_scale_factor.py")
+            print("Using default scale_factor=1.0 (NOT RECOMMENDED)")
+            print("="*70)
+            scale_factor = 1.0
+    
     # Default diffusion transformer parameters
     default_kwargs = {
         'num_frames': num_frames_latent,
@@ -396,73 +360,13 @@ def create_vq_latent_diffusion(
     }
     default_kwargs.update(diffusion_kwargs)
     
-    # Create model
+    # Create model with scale_factor
     model = VQLatentDiffusion(
         vqvae_config=vqvae_config,
         vqvae_checkpoint=vqvae_checkpoint,
         freeze_vqvae=freeze_vqvae,
+        scale_factor=scale_factor,  # CRITICAL PARAMETER
         **default_kwargs
     )
     
     return model.to(device)
-
-
-# Example usage
-# if __name__ == "__main__":
-#     # Test VQLatentDiffusion
-#     print("="*50)
-#     print("Testing RVQLatentDiffusion")
-#     print("="*50)
-    
-#     # Create model
-#     model = create_vq_latent_diffusion(
-#         dataset_name='beat',
-#         vqvae_name='VQVAE_BEAT',
-#         device='cuda',
-#         freeze_vqvae=True,
-#         num_layers=6,  # Smaller for testing
-#     )
-    
-#     print(f"\nModel created:")
-#     print(f"  Total parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
-#     print(f"  Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)/1e6:.2f}M")
-    
-#     # Test forward pass with raw motion
-#     B, T_original, D = 4, 360, 264
-#     motion = torch.randn(B, T_original, D).cuda()
-#     timesteps = torch.randint(0, 1000, (B,)).cuda()
-#     text = ["a person walks forward"] * B
-#     length = [360, 360, 360, 360]
-    
-#     print(f"\nTesting forward pass:")
-#     print(f"  Input motion: {motion.shape}")
-#     print(f"  Timesteps: {timesteps.shape}")
-    
-#     # Encode to latent
-#     with torch.no_grad():
-#         latent, code_idx = model.encode_to_latent(motion)
-#     print(f"  Encoded latent: {latent.shape}")
-#     print(f"  Code indices: {code_idx.shape}")
-    
-#     # Forward pass
-#     output = model(latent, timesteps, length=length, text=text)
-#     print(f"  Output (predicted): {output.shape}")
-    
-#     # Decode back
-#     with torch.no_grad():
-#         recon = model.decode_from_latent(latent=output)
-#     print(f"  Reconstructed motion: {recon.shape}")
-    
-#     # Test with wrapper
-#     print(f"\nTesting with wrapper:")
-#     wrapper = VQLatentDiffusionWrapper(model)
-#     y_dict = {
-#         'text': text,
-#         'length': length
-#     }
-#     output_wrapper = wrapper(latent, timesteps, y=y_dict)
-#     print(f"  Wrapper output: {output_wrapper.shape}")
-    
-#     print("\n" + "="*50)
-#     print("All tests passed!")
-#     print("="*50)

@@ -45,7 +45,6 @@ def arg_parse(is_train=False):
 
     parser.add_argument('--ext', type=str, default='default', help='reconstruction loss')
 
-
     ## other
     parser.add_argument('--name', type=str, default="test", help='Name of this trial')
     parser.add_argument('--is_continue', action="store_true", help='Name of this trial')
