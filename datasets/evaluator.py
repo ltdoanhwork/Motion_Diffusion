@@ -367,9 +367,14 @@ def build_models(opt):
                                       output_size=opt.dim_coemb_hidden,
                                       device=opt.device)
 
-    # checkpoint = torch.load(pjoin('/home/ltdoanh/jupyter/jupyter/ldtan/MotionDiffuse', 't2m', 'text_mot_match', 'model', 'finest.tar'),
-    #                         map_location=opt.device)
-    checkpoint = torch.load(pjoin('/home/ltdoanh/jupyter/jupyter/ldtan/MotionDiffuse/text_mot_match/model/finest.tar'))
+    # --- PHẦN ĐÃ SỬA ---
+    # Sử dụng opt.evaluator_path thay vì đường dẫn cứng
+    if not os.path.exists(opt.evaluator_path):
+        raise FileNotFoundError(f"Could not find evaluator model at: {opt.evaluator_path}")
+        
+    checkpoint = torch.load(opt.evaluator_path, map_location=opt.device)
+    # -------------------
+    
     movement_enc.load_state_dict(checkpoint['movement_encoder'])
     text_enc.load_state_dict(checkpoint['text_encoder'])
     motion_enc.load_state_dict(checkpoint['motion_encoder'])
@@ -385,6 +390,8 @@ class EvaluatorModelWrapper(object):
             opt.dim_pose = 263
         elif opt.dataset_name == 'kit':
             opt.dim_pose = 251
+        elif opt.dataset_name == 'beat':
+            opt.dim_pose = 263
         else:
             raise KeyError('Dataset not Recognized!!!')
 

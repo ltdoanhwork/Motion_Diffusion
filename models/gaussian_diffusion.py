@@ -334,11 +334,22 @@ class GaussianDiffusion:
         model_var_type,
         loss_type,
         rescale_timesteps=False,
+        # THÊM CÁC THAM SỐ MỚI
+        vq_model=None,
+        hand_indices=None,
+        body_indices=None,
+        hand_loss_weight=10.0,
     ):
         self.model_mean_type = model_mean_type
         self.model_var_type = model_var_type
         self.loss_type = loss_type
         self.rescale_timesteps = rescale_timesteps
+        
+        # THÊM: Lưu các tham số cho hand/body loss
+        self.vq_model = vq_model
+        self.hand_indices = hand_indices
+        self.body_indices = body_indices
+        self.hand_loss_weight = hand_loss_weight
 
         # Use float64 for accuracy.
         betas = np.array(betas, dtype=np.float64)
@@ -365,8 +376,6 @@ class GaussianDiffusion:
         self.posterior_variance = (
             betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
         )
-        # log calculation clipped because the posterior variance is 0 at the
-        # beginning of the diffusion chain.
         self.posterior_log_variance_clipped = np.log(
             np.append(self.posterior_variance[1], self.posterior_variance[1:])
         )
@@ -379,6 +388,134 @@ class GaussianDiffusion:
             / (1.0 - self.alphas_cumprod)
         )
 
+    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
+        """
+        Compute training losses for a single timestep.
+        MODIFIED: Added separate hand/body loss calculation in motion space
+        
+        :param model: the model to evaluate loss on.
+        :param x_start: the [N x C x ...] tensor of inputs (LATENT space).
+        :param t: a batch of timestep indices.
+        :param model_kwargs: if not None, a dict of extra keyword arguments to
+            pass to the model. This can be used for conditioning.
+        :param noise: if specified, the specific Gaussian noise to try to remove.
+        :return: a dict with the key "loss" containing a tensor of shape [N].
+                 Some mean or variance settings may also have other keys.
+        """
+        if model_kwargs is None:
+            model_kwargs = {}
+        if noise is None:
+            noise = th.randn_like(x_start)
+        x_t = self.q_sample(x_start, t, noise=noise)
+
+        terms = {}
+
+        if self.loss_type == LossType.KL or self.loss_type == LossType.RESCALED_KL:
+            terms["loss"] = self._vb_terms_bpd(
+                model=model,
+                x_start=x_start,
+                x_t=x_t,
+                t=t,
+                clip_denoised=False,
+                model_kwargs=model_kwargs,
+            )["output"]
+            if self.loss_type == LossType.RESCALED_KL:
+                terms["loss"] *= self.num_timesteps
+                
+        elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
+            model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
+
+            if self.model_var_type in [
+                ModelVarType.LEARNED,
+                ModelVarType.LEARNED_RANGE,
+            ]:
+                B, C = x_t.shape[:2]
+                assert model_output.shape == (B, C * 2, *x_t.shape[2:])
+                model_output, model_var_values = th.split(model_output, C, dim=1)
+                frozen_out = th.cat([model_output.detach(), model_var_values], dim=1)
+                terms["vb"] = self._vb_terms_bpd(
+                    model=lambda *args, r=frozen_out: r,
+                    x_start=x_start,
+                    x_t=x_t,
+                    t=t,
+                    clip_denoised=False,
+                )["output"]
+                if self.loss_type == LossType.RESCALED_MSE:
+                    terms["vb"] *= self.num_timesteps / 1000.0
+
+            # =================================================================
+            # PHẦN 1: LOSS LATENT (Giữ nguyên để model học representation tốt)
+            # =================================================================
+            target = {
+                ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(
+                    x_start=x_start, x_t=x_t, t=t
+                )[0],
+                ModelMeanType.START_X: x_start,
+                ModelMeanType.EPSILON: noise,
+            }[self.model_mean_type]
+            
+            assert model_output.shape == target.shape == x_start.shape
+            loss_latent = mean_flat((target - model_output) ** 2)
+            
+            # =================================================================
+            # PHẦN 2: LOSS GEOMETRIC (Hand/Body riêng biệt trên Motion Space)
+            # =================================================================
+            # Chỉ tính nếu có đầy đủ công cụ (vq_model + indices + raw_motion)
+            if (self.vq_model is not None and 
+                self.hand_indices is not None and 
+                self.body_indices is not None and
+                'y' in model_kwargs and 
+                'raw_motion' in model_kwargs['y']):
+                
+                # Bước A: Dự đoán Latent sạch (x_0) từ output
+                if self.model_mean_type == ModelMeanType.EPSILON:
+                    pred_latent = self._predict_xstart_from_eps(x_t=x_t, t=t, eps=model_output)
+                elif self.model_mean_type == ModelMeanType.START_X:
+                    pred_latent = model_output
+                else:  # PREVIOUS_X
+                    pred_latent = self._predict_xstart_from_xprev(x_t=x_t, t=t, xprev=model_output)
+                
+                # Bước B: Decode Latent ra Motion (KHÔNG detach để gradient flow)
+                pred_motion = self.vq_model.decode_from_latent(latent=pred_latent)
+                target_motion = model_kwargs['y']['raw_motion']
+                
+                # Kiểm tra shape
+                assert pred_motion.shape == target_motion.shape, \
+                    f"Shape mismatch: pred={pred_motion.shape}, target={target_motion.shape}"
+                
+                # Bước C: Tính MSE cho từng frame
+                # Shape: (B, T, 264)
+                diff_motion = (pred_motion - target_motion) ** 2
+                
+                # Bước D: Tách loss Hand và Body
+                # hand_indices: array các index cột thuộc tay (ví dụ [0,1,2,...,89])
+                # body_indices: array các index cột thuộc thân (ví dụ [90,91,...,263])
+                
+                loss_hand = diff_motion[:, :, self.hand_indices].mean()
+                loss_body = diff_motion[:, :, self.body_indices].mean()
+                
+                # Bước E: Tổng hợp Loss
+                # Loss = Loss_Latent + Loss_Body + (Weight * Loss_Hand)
+                terms["loss"] = loss_latent + (self.hand_loss_weight * loss_hand)
+                
+                # Lưu lại các loss riêng để logging (optional)
+                terms["loss_latent"] = loss_latent.detach()
+                terms["loss_hand"] = loss_hand.detach()
+                # terms["loss_body"] = loss_body.detach()
+                
+            else:
+                # Nếu không có config hand/body, chạy như cũ
+                terms["loss"] = loss_latent
+            
+            # Lưu target và pred để debug (optional)
+            terms["target"] = target
+            terms["pred"] = model_output
+            
+        else:
+            raise NotImplementedError(self.loss_type)
+
+        return terms
+    
     def q_mean_variance(self, x_start, t):
         """
         Get the distribution q(x_t | x_0).
@@ -975,7 +1112,7 @@ class GaussianDiffusion:
         output = th.where((t == 0), decoder_nll, kl)
         return {"output": output, "pred_xstart": out["pred_xstart"]}
 
-    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
+    def training_losses_(self, model, x_start, t, model_kwargs=None, noise=None):
         """
         Compute training losses for a single timestep.
 
@@ -1126,7 +1263,6 @@ class GaussianDiffusion:
             "xstart_mse": xstart_mse,
             "mse": mse,
         }
-
 
 def _extract_into_tensor(arr, timesteps, broadcast_shape):
     """

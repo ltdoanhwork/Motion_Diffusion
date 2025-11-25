@@ -60,4 +60,3 @@ t2m_right_hand_chain = [[21, 43, 44, 45], [21, 46, 47, 48], [21, 40, 41, 42], [2
 kit_tgt_skel_id = '03950'
 
 t2m_tgt_skel_id = '000021'
-

@@ -167,6 +167,7 @@ class Text2MotionDataset(data.Dataset):
             word_embeddings = np.concatenate(word_embeddings, axis=0)
             return word_embeddings, pos_one_hots, caption, sent_len, motion, m_length
         return caption, motion, m_length
+    
 class Beat2MotionDataset(Dataset):
     """
     Dataset for BEAT‑like motion‑text clips stored as
@@ -222,14 +223,20 @@ class Beat2MotionDataset(Dataset):
                 T, D = motion_raw.shape
                 # ----- optional representation conversion -----
                 betas = None         # BEAT stores body shape; keep None if you do not use it
-                if self.use_rep == 'rep15d':
-                    rep = get_motion_rep_numpy(motion_raw, betas=betas, device='cpu')
-                    motion_proc = rep['rep15d']               # (T, 55*15)
-                elif self.use_rep == 'position':
-                    rep = get_motion_rep_numpy(motion_raw, betas=betas, device='cpu')
-                    motion_proc = rep['position'].reshape(T, -1)
-                else:  # 'axis_angle'
-                    motion_proc = motion_raw                  # (T, 264)
+                # if self.use_rep == 'rep15d':
+                #     rep = get_motion_rep_numpy(motion_raw, betas=betas, device='cpu')
+                #     motion_proc = rep['rep15d']               # (T, 55*15)
+                # elif self.use_rep == 'position':
+                #     rep = get_motion_rep_numpy(motion_raw, betas=betas, device='cpu')
+                #     motion_proc = rep['position'].reshape(T, -1)
+                # else:  # 'axis_angle'
+                #     motion_proc = motion_raw                  # (T, 264)
+                if self.use_rep == 'position':
+                    motion_proc = motion_raw 
+                elif self.use_rep == 'axis_angle':
+                    motion_proc = motion_raw
+                else:
+                    raise ValueError(f"motion_rep '{self.use_rep}' không được hỗ trợ hoặc không khớp với dữ liệu .npy")
 
                 # ----- load caption(s) -----
                 with cs.open(txt_path, 'r', encoding='utf‑8') as f:
@@ -341,8 +348,8 @@ class Beat2MotionDataset(Dataset):
             caption = text_d.get('caption', '<no caption>')
             if not isinstance(caption, str):
                 raise TypeError(f"caption is not string: {caption}")
-            print(f"[INFO] {name} | len: {m_len} | caption: {caption}")
-            print(f"  motion shape: {motion.shape} ")
+            # print(f"[INFO] {name} | len: {m_len} | caption: {caption}")
+            # print(f"  motion shape: {motion.shape} ")
             return caption, motion.astype(np.float32), m_len
 
         except Exception as e:
