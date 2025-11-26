@@ -19,5 +19,11 @@ out_dir = "/home/serverai/ltdoanh/Motion_Diffusion/datasets/BEAT_numpy"
 # os.system(command3)
 
 print("Đang chạy train_vq_diffusion.py...")
-command4 = f'python ./tools/train_vq_diffusion.py --dataset_name beat --data_root ./datasets/BEAT_numpy --vqvae_name VQVAE_BEAT --scale_factor 7.53435087 --batch_size 64 --max_epoch 200 --cond_drop_prob 0.1 --guidance_scale 2.0 --hand_loss_weight 50.0 --lr 2e-4'
+
+command4 = f'python tools/train_vq_diffusion.py \
+            --name vqkl_diffusion \
+            --vqkl_name VQKL_BEAT \
+            --use_kl_posterior \
+            --hand_boost_factor 2.0'
+
 os.system(command4)

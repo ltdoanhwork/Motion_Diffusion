@@ -342,3 +342,7 @@ if __name__ == '__main__':
         end=args.end,
         batch_size=args.batch_size
     )
+
+"""
+python step1_fit_scaler.py --parent-dir ./BEAT_numpy --folders "train,val,test" --batch-size 100
+"""

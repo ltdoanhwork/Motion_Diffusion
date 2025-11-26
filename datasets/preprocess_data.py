@@ -349,3 +349,9 @@ if __name__ == '__main__':
             end=args.end,
             num_workers=args.workers
         )
+
+"""
+
+python preprocess_data.py --parent-dir ./BEAT --folders "train,val,test" --out-root ./BEAT_numpy --pipeline global_pipeline.pkl --workers 8
+
+"""

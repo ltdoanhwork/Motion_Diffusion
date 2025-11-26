@@ -1,3 +1,7 @@
+"""
+Training script for VQ-KL Autoencoder (Hybrid VQ-VAE + KL Divergence)
+Combines discrete vector quantization with continuous KL regularization
+"""
 import os
 import sys
 from os.path import join as pjoin
@@ -8,12 +12,10 @@ import torch
 from torch.utils.data import DataLoader
 
 # --- 1. THIẾT LẬP ĐƯỜNG DẪN ---
-# Đảm bảo ROOT là thư mục cha của 'tools/' (ví dụ: /.../Motion_Diffusion)
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-# Thêm pymo vào path để joblib có thể load pipeline
 PYMO_DIR = os.path.join(ROOT, 'datasets', 'pymo')
 if PYMO_DIR not in sys.path:
     sys.path.insert(0, PYMO_DIR)
@@ -54,8 +56,9 @@ def create_train_split(motion_dir, split_file):
     
     print(f"[INFO] Created {split_file}")
 
+
 def create_val_split(train_file, val_file, val_ratio=0.1):
-    """Tự động tạo val.txt bằng cách tách 10% từ train.txt"""
+    """Tự động tạo val.txt bằng cách tách từ train.txt"""
     if os.path.exists(val_file):
         print(f"[INFO] {val_file} already exists")
         return
@@ -69,7 +72,7 @@ def create_val_split(train_file, val_file, val_ratio=0.1):
     np.random.shuffle(all_lines)
     val_size = int(len(all_lines) * val_ratio)
     if val_size == 0 and len(all_lines) > 0:
-        val_size = 1 # Đảm bảo có ít nhất 1 sample
+        val_size = 1
         
     val_lines = all_lines[:val_size]
     train_lines = all_lines[val_size:]
@@ -81,12 +84,12 @@ def create_val_split(train_file, val_file, val_ratio=0.1):
     with open(val_file, 'w', encoding='utf-8') as f:
         f.write('\n'.join(val_lines) + '\n')
     
-    # print(f"[INFO] Created {val_file} with {len(val_lines)} samples.")
-    print(f"[INFO] {train_file} updated, now has {len(train_lines)} samples.")
+    print(f"[INFO] Created {val_file} with {len(val_lines)} samples")
+    print(f"[INFO] Updated {train_file} with {len(train_lines)} samples")
 
 
 class DummyOpt:
-    """Giả lập các options mà Beat2MotionDataset cần."""
+    """Giả lập các options mà Beat2MotionDataset cần"""
     def __init__(self, args, is_train):
         self.motion_dir = args.motion_dir
         self.text_dir = args.text_dir
@@ -94,58 +97,108 @@ class DummyOpt:
         self.dataset_name = args.dataset_name
         self.motion_rep = args.motion_rep
         self.is_train = is_train
-        self.joints_num = args.joints_num # Cần cho vq_trainer
+        self.joints_num = args.joints_num
+
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description='Train VQ-KL Autoencoder (Hybrid VQ + KL)')
     
-    # --- Paths ---
-    parser.add_argument('--checkpoints_dir', type=str, default='./checkpoints', help='Thư mục gốc lưu checkpoints')
-    parser.add_argument('--name', type=str, default='VQVAE_BEAT', help='Tên của thử nghiệm này (để tạo thư mục checkpoint)')
-    parser.add_argument('--dataset_name', type=str, default='beat', choices=['t2m', 'kit', 'beat'], help='Tên dataset')
-    parser.add_argument('--data_root', type=str, default='./datasets/BEAT_numpy', help='Đường dẫn đến data BEAT đã xử lý (chứa npy/ và txt/)')
+    # ==================== Paths ====================
+    parser.add_argument('--checkpoints_dir', type=str, default='./checkpoints',
+                        help='Thư mục gốc lưu checkpoints')
+    parser.add_argument('--name', type=str, default='VQKL_BEAT',
+                        help='Tên thử nghiệm (VQ-KL thay vì VQ-VAE)')
+    parser.add_argument('--dataset_name', type=str, default='beat', 
+                        choices=['t2m', 'kit', 'beat'],
+                        help='Tên dataset')
+    parser.add_argument('--data_root', type=str, default='./datasets/BEAT_numpy',
+                        help='Đường dẫn data BEAT (chứa npy/ và txt/)')
     
-    # --- Model Params (VQ-VAE) ---
-    parser.add_argument('--dim_pose', type=int, default=264, help='Kích thước vector motion (264 cho BEAT)')
-    parser.add_argument('--codebook_dim', type=int, default=512, help='Kích thước của codebook embedding (latent_dim)')
-    parser.add_argument('--num_codebooks', type=int, default=10, help='Số lượng codebook (cho RVQ)')
-    parser.add_argument('--codebook_size', type=int, default=1024, help='Số lượng code (vector) trong mỗi codebook')
-    parser.add_argument('--joints_num', type=int, default=55, help='Số khớp (55 cho BEAT)')
-
-    # --- Training Params ---
-    parser.add_argument('--max_epoch', type=int, default=25, help='Số epoch tối đa')
-    parser.add_argument('--batch_size', type=int, default=64, help='Batch size')
-    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
-    parser.add_argument('--weight_decay', type=float, default=0.01, help='Weight decay')
-    parser.add_argument('--is_continue', action='store_true', help='Tiếp tục training từ checkpoint "latest.tar"')
-    parser.add_argument('--num_workers', type=int, default=4, help='Số luồng tải data')
+    # ==================== VQ-KL Model Params ====================
+    parser.add_argument('--dim_pose', type=int, default=264,
+                        help='Kích thước vector motion (264 cho BEAT)')
+    parser.add_argument('--codebook_dim', type=int, default=512,
+                        help='Kích thước codebook embedding (cho VQ)')
+    parser.add_argument('--embed_dim', type=int, default=512,
+                        help='Kích thước embedding cho KL posterior (continuous latent)')
+    parser.add_argument('--num_codebooks', type=int, default=10,
+                        help='Số lượng codebook (cho RVQ)')
+    parser.add_argument('--codebook_size', type=int, default=1024,
+                        help='Số code trong mỗi codebook')
+    parser.add_argument('--joints_num', type=int, default=55,
+                        help='Số khớp (55 cho BEAT)')
     
-    # --- Trainer Params (từ vq_trainer.py) ---
-    parser.add_argument('--recons_loss', type=str, default='l1', choices=['l1', 'l1_smooth'], help='Loại loss tái tạo')
-    parser.add_argument('--loss_vel', type=float, default=0.1, help='Trọng số cho loss_explicit (sẽ bị bỏ qua nếu bạn sửa vq_trainer)')
-    parser.add_argument('--commit', type=float, default=0.02, help='Trọng số cho commitment loss')
-    parser.add_argument('--warm_up_iter', type=int, default=1000, help='Số iter warm up cho learning rate')
-    parser.add_argument('--milestones', type=int, nargs='+', default=[20, 40, 60], help='Epochs để giảm LR')
-    parser.add_argument('--gamma', type=float, default=0.5, help='Hệ số giảm LR')
+    # ==================== VQ-KL Specific ====================
+    parser.add_argument('--double_z', action='store_true', default=True,
+                        help='Encode thành mean + logvar cho KL (bắt buộc cho VQ-KL)')
+    parser.add_argument('--use_posterior_sample', action='store_true', default=True,
+                        help='Sample từ posterior thay vì dùng mean')
     
-    # --- Logging ---
-    parser.add_argument('--log_every', type=int, default=50, help='Log loss mỗi N iteration')
-    parser.add_argument('--save_latest', type=int, default=500, help='Lưu checkpoint latest.tar mỗi N iteration')
-    parser.add_argument('--eval_every_e', type=int, default=5, help='Chạy evaluation mỗi N epoch (nếu có)')
+    # ==================== Training Params ====================
+    parser.add_argument('--max_epoch', type=int, default=25,
+                        help='Số epoch tối đa')
+    parser.add_argument('--batch_size', type=int, default=64,
+                        help='Batch size')
+    parser.add_argument('--lr', type=float, default=1e-3,
+                        help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=0.01,
+                        help='Weight decay')
+    parser.add_argument('--is_continue', action='store_true',
+                        help='Tiếp tục từ checkpoint latest.tar')
+    parser.add_argument('--num_workers', type=int, default=4,
+                        help='Số workers cho dataloader')
     
-    # --- Device ---
-    parser.add_argument('--gpu_id', type=int, default=0, help='ID của GPU')
-    parser.add_argument('--seed', type=int, default=3407, help='Random seed')
+    # ==================== Loss Weights (VQ-KL) ====================
+    parser.add_argument('--recons_loss', type=str, default='l1', 
+                        choices=['l1', 'l1_smooth', 'l2'],
+                        help='Loại reconstruction loss')
+    parser.add_argument('--loss_vel', type=float, default=0.1,
+                        help='Trọng số velocity loss (deprecated, có thể bỏ qua)')
+    parser.add_argument('--commit', type=float, default=0.02,
+                        help='Trọng số commitment loss (cho VQ)')
+    parser.add_argument('--kl_weight', type=float, default=1e-6,
+                        help='Trọng số KL divergence loss (CRITICAL cho VQ-KL)')
+    parser.add_argument('--perceptual_weight', type=float, default=0.0,
+                        help='Trọng số perceptual loss (optional)')
+    
+    # ==================== Training Schedule ====================
+    parser.add_argument('--warm_up_iter', type=int, default=1000,
+                        help='Số iter warm up cho learning rate')
+    parser.add_argument('--milestones', type=int, nargs='+', default=[20, 40, 60],
+                        help='Epochs để giảm LR')
+    parser.add_argument('--gamma', type=float, default=0.5,
+                        help='Hệ số giảm LR tại milestones')
+    
+    # ==================== Logging ====================
+    parser.add_argument('--log_every', type=int, default=50,
+                        help='Log loss mỗi N iterations')
+    parser.add_argument('--save_latest', type=int, default=500,
+                        help='Lưu latest.tar mỗi N iterations')
+    parser.add_argument('--eval_every_e', type=int, default=5,
+                        help='Evaluate mỗi N epochs')
+    
+    # ==================== Device ====================
+    parser.add_argument('--gpu_id', type=int, default=0,
+                        help='GPU ID')
+    parser.add_argument('--seed', type=int, default=3407,
+                        help='Random seed')
 
     args = parser.parse_args()
 
-    # --- 6. THIẾT LẬP HỆ THỐNG ---
+    # ==================== Setup System ====================
     fixseed(args.seed)
     args.is_train = True
     args.device = torch.device(f'cuda:{args.gpu_id}' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {args.device}")
+    
+    print("\n" + "="*70)
+    print("VQ-KL AUTOENCODER TRAINING")
+    print("="*70)
+    print(f"Device: {args.device}")
+    print(f"Architecture: Hybrid VQ + KL Divergence")
+    print(f"Dataset: {args.dataset_name.upper()}")
+    print("="*70 + "\n")
 
-    # --- 7. THIẾT LẬP THƯ MỤC ---
+    # ==================== Setup Directories ====================
     args.save_root = pjoin(args.checkpoints_dir, args.dataset_name, args.name)
     args.model_dir = pjoin(args.save_root, 'model')
     args.log_dir = pjoin(args.save_root, 'logs')
@@ -153,38 +206,39 @@ def main():
     os.makedirs(args.model_dir, exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
     
-    # --- 8. CẤU HÌNH DATASET (BEAT) ---
+    print(f"[INFO] Checkpoints: {args.save_root}")
+    
+    # ==================== Dataset Config ====================
     args.motion_dir = pjoin(args.data_root, 'npy')
     args.text_dir = pjoin(args.data_root, 'txt')
-    args.max_motion_length = 360  # ~6 giây @ 60fps
-    args.motion_rep = 'position'  # Phải khớp với pipeline tiền xử lý
+    args.max_motion_length = 360  # ~6 seconds @ 60fps
+    args.motion_rep = 'position'
     
-    # --- 9. TẢI MEAN/STD TỪ PIPELINE ---
+    # ==================== Load Mean/Std ====================
     stats_file_path = pjoin(ROOT, 'global_pipeline.pkl')
-    print(f"[INFO] Loading stats from {stats_file_path}")
+    print(f"[INFO] Loading normalization stats from {stats_file_path}")
     try:
         pipeline = joblib.load(stats_file_path)
         scaler = pipeline.named_steps['stdscale']
         mean = scaler.data_mean_
         std = scaler.data_std_
-        print("[INFO] Mean and Std loaded successfully from pipeline.")
+        print("[INFO] ✓ Mean and Std loaded successfully")
     except Exception as e:
-        print(f"[ERROR] Could not load mean/std from {stats_file_path}: {e}")
+        print(f"[ERROR] Could not load mean/std: {e}")
         print("Exiting.")
         sys.exit(1)
 
-    # --- 10. TẠO DATA LOADER (SỬA ĐỔI) ---
+    # ==================== Create Data Splits ====================
     train_split_file = pjoin(args.data_root, 'train.txt')
-    val_split_file = pjoin(args.data_root, 'val.txt')  # <--- THÊM MỚI: Định nghĩa file val
+    val_split_file = pjoin(args.data_root, 'val.txt')
 
-    # B1: Tự động tạo file train.txt (chứa tất cả) nếu chưa có
     create_train_split(args.motion_dir, train_split_file)
+    create_val_split(train_split_file, val_split_file, val_ratio=0.1)
 
-    # B2: Tự động tách 10% từ train.txt sang val.txt nếu chưa có file val
-    # Hàm này sẽ ghi đè train.txt (ít đi) và tạo val.txt mới
-    create_val_split(train_split_file, val_split_file, val_ratio=0.1) # <--- THÊM MỚI
-
-    # --- Setup Train Loader ---
+    # ==================== Setup Dataloaders ====================
+    print("\n[INFO] Setting up dataloaders...")
+    
+    # Train loader
     train_opt = DummyOpt(args, is_train=True)
     train_dataset = DatasetClass(train_opt, mean, std, train_split_file)
     train_loader = DataLoader(
@@ -196,60 +250,112 @@ def main():
         drop_last=True
     )
 
-    # --- Setup Validation Loader (THÊM MỚI) ---
-    print(f"[INFO] Loading Validation Dataset...")
-    val_opt = DummyOpt(args, is_train=False) # is_train=False để không shuffle/augment nếu dataset có logic đó
+    # Validation loader
+    val_opt = DummyOpt(args, is_train=False)
     val_dataset = DatasetClass(val_opt, mean, std, val_split_file)
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
-        shuffle=False, # Validation không cần shuffle
+        shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
-        drop_last=False # Không cần drop last
+        drop_last=False
     )
     
-    print(f"Train dataset: {len(train_dataset)} samples")
-    print(f"Validation dataset: {len(val_dataset)} samples") # <--- Log số lượng
+    print(f"[INFO] ✓ Train dataset: {len(train_dataset)} samples")
+    print(f"[INFO] ✓ Validation dataset: {len(val_dataset)} samples")
 
-    # --- 11. KHỞI TẠO MÔ HÌNH VQ-VAE ---
-    # (Giữ nguyên code cũ của bạn)
+    # ==================== Initialize VQ-KL Model ====================
+    print("\n[INFO] Initializing VQ-KL Autoencoder...")
+    
+    # Setup quantizer args
     args.num_quantizers = args.num_codebooks 
     args.shared_codebook = False 
     args.quantize_dropout_prob = 0.0 
-    args.mu = 0.99 
+    args.mu = 0.99
 
+    # Print architecture details
+    print(f"[INFO] Architecture configuration:")
+    print(f"  - Input dim: {args.dim_pose}")
+    print(f"  - Codebook size: {args.codebook_size}")
+    print(f"  - Codebook dim (VQ): {args.codebook_dim}")
+    print(f"  - Embed dim (KL): {args.embed_dim}")
+    print(f"  - Num quantizers: {args.num_codebooks}")
+    print(f"  - Double z (mean+logvar): {args.double_z}")
+    print(f"  - Temporal downsampling: 8x (down_t=3)")
+    print(f"\n[INFO] Loss weights:")
+    print(f"  - Reconstruction: 1.0 ({args.recons_loss})")
+    print(f"  - Commitment: {args.commit}")
+    print(f"  - KL divergence: {args.kl_weight}")
+    if args.perceptual_weight > 0:
+        print(f"  - Perceptual: {args.perceptual_weight}")
+
+    # Create VQ-KL model
     model = RVQVAE(
         args, 
         input_width=args.dim_pose, 
         nb_code=args.codebook_size, 
-        code_dim=args.codebook_dim, 
+        code_dim=args.codebook_dim,
+        embed_dim=args.embed_dim,  # For KL posterior
         output_emb_width=args.codebook_dim, 
-        down_t=3,
+        down_t=3,  # 360 -> 45 frames (8x downsampling)
         stride_t=2,
         width=512,
         depth=3, 
         dilation_growth_rate=3,
         activation='relu',
-        norm=None
-        )
+        norm=None,
+        double_z=args.double_z  # Enable KL: encode to mean + logvar
+    )
     
-    print(f"VQ-VAE Model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)/1e6:.2f}M")
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"\n[INFO] ✓ Model initialized: {total_params/1e6:.2f}M parameters")
 
-    # --- 12. KHỞI TẠO TRAINER ---
-    trainer = RVQTokenizerTrainer(args, model)  
-
-    # --- 13. HUẤN LUYỆN (SỬA ĐỔI) ---
-    print("Starting VQ-VAE Training...")
+    # ==================== Initialize Trainer ====================
+    print("\n[INFO] Initializing VQ-KL Trainer...")
     
-    # Truyền val_loader vào đây
+    # Pass KL-specific parameters to trainer
+    trainer = RVQTokenizerTrainer(
+        args, 
+        model,
+        kl_weight=args.kl_weight,  # Critical for VQ-KL
+        use_posterior_sample=args.use_posterior_sample
+    )
+    
+    print("[INFO] ✓ Trainer ready")
+
+    # ==================== Start Training ====================
+    print("\n" + "="*70)
+    print("STARTING VQ-KL TRAINING")
+    print("="*70)
+    print(f"Max epochs: {args.max_epoch}")
+    print(f"Batch size: {args.batch_size}")
+    print(f"Initial LR: {args.lr}")
+    print(f"LR milestones: {args.milestones}")
+    print(f"Mode: {'Continue' if args.is_continue else 'From scratch'}")
+    print("="*70 + "\n")
+    
     trainer.train(
         train_loader, 
-        val_loader=val_loader, # <--- QUAN TRỌNG: Truyền val_loader vào
+        val_loader=val_loader,
         eval_val_loader=None, 
         eval_wrapper=None, 
         plot_eval=None
     )
+    
+    # ==================== Training Complete ====================
+    print("\n" + "="*70)
+    print("TRAINING COMPLETED SUCCESSFULLY!")
+    print("="*70)
+    print(f"Model saved to: {args.model_dir}")
+    print(f"Logs saved to: {args.log_dir}")
+    print("\nNext steps:")
+    print("1. Calculate scale_factor:")
+    print(f"   python tools/calculate_scale_factor.py --vqkl_name {args.name}")
+    print("2. Train diffusion model:")
+    print(f"   python tools/train_vqkl_diffusion.py --vqkl_name {args.name}")
+    print("="*70 + "\n")
+
 
 if __name__ == "__main__":
     main()
