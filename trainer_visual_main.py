@@ -22,8 +22,8 @@ print("Đang chạy train_vq_diffusion.py...")
 
 command4 = f'python tools/train_vq_diffusion.py \
             --name vqkl_diffusion \
-            --vqkl_name VQKL_GAN_BEAT \
-            --scale_factor 1.39714289 \
+            --vqkl_name VQKL_Attention_BEAT \
+            --scale_factor 1.64244270 \
             --use_kl_posterior \
             --hand_boost_factor 2.0'
 
