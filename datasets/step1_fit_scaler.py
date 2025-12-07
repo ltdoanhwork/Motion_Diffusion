@@ -5,6 +5,7 @@ from tqdm import tqdm
 import multiprocessing
 import argparse
 import re
+import gc
 
 PYOM_DIR = "/home/serverai/ltdoanh/Motion_Diffusion/datasets/pymo"
 if PYOM_DIR not in sys.path:
@@ -17,50 +18,56 @@ from sklearn.base import BaseEstimator, TransformerMixin
 
 
 class OnlineStatsCalculator:
-    """
-    Tính mean/std theo cách streaming (Welford's algorithm)
-    để tránh load toàn bộ data vào RAM.
-    """
     def __init__(self):
         self.n = 0
         self.mean = None
         self.M2 = None
     
     def update(self, batch_data):
-        """
-        Update statistics với một batch mới.
-        batch_data: numpy array shape (n_samples, n_features)
-        """
         if batch_data.size == 0:
             return
             
-        # Flatten nếu là 3D (batch, time, features) -> (n_samples, features)
         if batch_data.ndim == 3:
             batch_data = batch_data.reshape(-1, batch_data.shape[-1])
         
-        for sample in batch_data:
-            self.n += 1
-            if self.mean is None:
-                self.mean = np.zeros_like(sample, dtype=np.float64)
-                self.M2 = np.zeros_like(sample, dtype=np.float64)
+        n_b = len(batch_data)
+        if n_b == 0: return
+
+        mean_b = np.mean(batch_data, axis=0)
+        M2_b = np.sum((batch_data - mean_b) ** 2, axis=0)
+        
+        if self.n == 0:
+            self.n = n_b
+            self.mean = mean_b
+            self.M2 = M2_b
+        else:
+            n_a = self.n
+            mean_a = self.mean
+            M2_a = self.M2
             
-            delta = sample - self.mean
-            self.mean += delta / self.n
-            delta2 = sample - self.mean
-            self.M2 += delta * delta2
-    
+            delta = mean_b - mean_a
+            
+            # Update n
+            self.n = n_a + n_b
+            
+            # Update mean
+            self.mean = mean_a + delta * n_b / self.n
+            
+            # Update M2
+            self.M2 = M2_a + M2_b + (delta ** 2) * (n_a * n_b / self.n)
+
     def finalize(self):
         """Trả về mean và std cuối cùng."""
         if self.n < 2:
+            if self.mean is None: return None, None
             return self.mean, np.ones_like(self.mean)
         
         variance = self.M2 / self.n
-        std = np.sqrt(variance) + 1e-8  # Thêm epsilon để tránh chia 0
+        std = np.sqrt(variance) + 1e-8  
         return self.mean, std
 
 
 class FixedDownSampler(BaseEstimator, TransformerMixin):
-    """DownSampler tương thích với MocapData."""
     def __init__(self, rate):
         self.rate = rate
     
@@ -79,12 +86,10 @@ class FixedDownSampler(BaseEstimator, TransformerMixin):
         return X
 
 
-# --- WORKER CHO MULTIPROCESSING ---
 g_parser = None
 g_partial_pipe = None
 
 def init_worker():
-    """Khởi tạo parser và pipeline cho worker."""
     global g_parser, g_partial_pipe
     g_parser = BVHParser()
     g_partial_pipe = Pipeline([
@@ -94,80 +99,51 @@ def init_worker():
     ])
 
 def worker_parse_and_transform(bvh_path):
-    """Worker: Parse + transform BVH file."""
     global g_parser, g_partial_pipe
     try:
         parsed_data = g_parser.parse(bvh_path)
         processed = g_partial_pipe.transform([parsed_data])[0]
         return processed
-    except Exception:
+    except Exception as e:
         return None
 
 
 def process_files_streaming(bvh_paths, stats_calculator, const_remover, 
                             downsampler, batch_size=100):
-    """
-    Xử lý files theo batch và update statistics streaming.
-    Không giữ toàn bộ data trong RAM.
-    
-    Args:
-        bvh_paths: List đường dẫn files BVH
-        stats_calculator: OnlineStatsCalculator instance
-        const_remover: ConstantsRemover đã fit
-        downsampler: DownSampler instance
-        batch_size: Số files xử lý mỗi lần
-    """
-    num_cores = min(multiprocessing.cpu_count(), 8)  # Giới hạn cores
+    num_cores = min(multiprocessing.cpu_count(), 16)
     
     for i in tqdm(range(0, len(bvh_paths), batch_size), 
-                  desc="Processing batches", ncols=100):
+                  desc="Processing batches (Pass 2 - Statistics)", ncols=100):
         batch_paths = bvh_paths[i:i + batch_size]
         
-        # Multiprocessing cho batch này
-        with multiprocessing.Pool(processes=num_cores, 
-                                 initializer=init_worker) as pool:
+        with multiprocessing.Pool(processes=num_cores, initializer=init_worker) as pool:
             results = pool.map(worker_parse_and_transform, batch_paths)
         
-        # Lọc kết quả hợp lệ
         valid_results = [r for r in results if r is not None]
         
         if not valid_results:
             continue
         
-        # Apply ConstantsRemover
         after_const = const_remover.transform(valid_results)
         
-        # Apply DownSampler
         downsampled = downsampler.transform(after_const)
         
-        # Convert sang numpy và update stats
         batch_arrays = [track.values.values for track in downsampled]
         if batch_arrays:
-            batch_data = np.concatenate(batch_arrays, axis=0)  # (total_frames, features)
+            batch_data = np.concatenate(batch_arrays, axis=0)
             stats_calculator.update(batch_data)
         
-        # Xóa để giải phóng RAM
         del results, valid_results, after_const, downsampled, batch_arrays
-        import gc
         gc.collect()
 
 
 def main_fit_scaler_efficient(parent_dir, folders=None, start=None, end=None, 
-                              batch_size=100):
-    """
-    Fit scaler với memory-efficient approach.
+                              batch_size=100, sample_size_limit=1000):
     
-    CHIẾN LƯỢC:
-    1. Pass đầu: Fit ConstantsRemover (cần toàn bộ data để xác định constant dims)
-    2. Pass hai: Tính mean/std theo streaming (không cần load toàn bộ vào RAM)
-    """
-    
-    # --- THU THẬP FOLDERS ---
     if folders:
         to_process = folders
     else:
-        entries = [d for d in os.listdir(parent_dir) 
-                  if os.path.isdir(os.path.join(parent_dir, d))]
+        entries = [d for d in os.listdir(parent_dir) if os.path.isdir(os.path.join(parent_dir, d))]
         numeric = [d for d in entries if re.fullmatch(r"\d+", d)]
         numeric_sorted = sorted(numeric, key=lambda x: int(x))
         
@@ -180,15 +156,14 @@ def main_fit_scaler_efficient(parent_dir, folders=None, start=None, end=None,
             to_process = numeric_sorted
 
     if not to_process:
-        print("❌ No folders found")
+        print(" No folders found")
         return
 
     print(f"\n{'='*60}")
-    print(f"🎯 MEMORY-EFFICIENT MODE")
-    print(f"📂 Folders to process: {len(to_process)}")
+    print(f" MEMORY-EFFICIENT MODE (SAFE FOR LARGE DATASET)")
+    print(f" Folders to process: {len(to_process)}")
     print(f"{'='*60}")
 
-    # --- THU THẬP TẤT CẢ FILES ---
     all_bvh_paths = []
     for folder in to_process:
         folder_path = os.path.join(parent_dir, folder)
@@ -203,25 +178,23 @@ def main_fit_scaler_efficient(parent_dir, folders=None, start=None, end=None,
         all_bvh_paths.extend(bvh_files)
 
     if not all_bvh_paths:
-        print("❌ No BVH files found")
+        print(" No BVH files found")
         return
 
-    print(f"✅ Found {len(all_bvh_paths)} BVH files")
+    print(f" Found total {len(all_bvh_paths)} BVH files")
 
-    # ============================================================
-    # PASS 1: FIT ConstantsRemover (cần sample nhỏ, không phải toàn bộ)
-    # ============================================================
     print(f"\n{'='*60}")
-    print(f"🔍 PASS 1: Fitting ConstantsRemover (sampling 1000 files)")
+    actual_sample_size = min(len(all_bvh_paths), sample_size_limit) 
+    
+    print(f" PASS 1: Fitting ConstantsRemover")
+    print(f"   Sampling: {actual_sample_size} random files (checking for dead joints)")
+    print(f"   Note: This step only detects structural constants.")
     print(f"{'='*60}")
     
-    # Lấy sample để fit ConstantsRemover (không cần toàn bộ data)
-    sample_size = min(1000, len(all_bvh_paths))
-    sample_paths = np.random.choice(all_bvh_paths, sample_size, replace=False)
+    sample_paths = np.random.choice(all_bvh_paths, actual_sample_size, replace=False)
     
-    num_cores = min(multiprocessing.cpu_count(), 8)
-    with multiprocessing.Pool(processes=num_cores, 
-                             initializer=init_worker) as pool:
+    num_cores = min(multiprocessing.cpu_count(), 16)
+    with multiprocessing.Pool(processes=num_cores, initializer=init_worker) as pool:
         sample_results = list(tqdm(
             pool.imap(worker_parse_and_transform, sample_paths),
             total=len(sample_paths),
@@ -232,25 +205,22 @@ def main_fit_scaler_efficient(parent_dir, folders=None, start=None, end=None,
     sample_mocap = [r for r in sample_results if r is not None]
     
     if not sample_mocap:
-        print("❌ Failed to process sample data")
+        print(" Failed to process sample data")
         return
     
     # Fit ConstantsRemover
     const_remover = ConstantsRemover()
     const_remover.fit(sample_mocap)
-    print(f"✅ ConstantsRemover fitted on {len(sample_mocap)} samples")
-    print(f"   Constant columns: {len(const_remover.const_dims_)}")
+    print(f" ConstantsRemover fitted.")
+    print(f"   Constant columns removed: {len(const_remover.const_dims_)}")
     
-    del sample_results, sample_mocap
-    import gc
-    gc.collect()
+    sample_for_numpyfier_raw = sample_mocap[0:10] 
 
-    # ============================================================
-    # PASS 2: TÍNH MEAN/STD THEO STREAMING
-    # ============================================================
+    del sample_results, sample_mocap
+    gc.collect()
     print(f"\n{'='*60}")
-    print(f"📊 PASS 2: Computing mean/std (streaming mode)")
-    print(f"   Batch size: {batch_size} files")
+    print(f" PASS 2: Computing Mean/Std on ALL {len(all_bvh_paths)} FILES")
+    print(f"   Note: Computing exact statistics on 100% of data.")
     print(f"{'='*60}")
     
     downsampler = FixedDownSampler(2)
@@ -264,32 +234,22 @@ def main_fit_scaler_efficient(parent_dir, folders=None, start=None, end=None,
         batch_size=batch_size
     )
     
-    # Finalize statistics
     mean, std = stats_calculator.finalize()
     
-    print(f"\n✅ Statistics computed!")
+    print(f"\n Statistics computed!")
     print(f"   Mean shape: {mean.shape}")
     print(f"   Std shape: {std.shape}")
-
-    # ============================================================
-    # PASS 3: TẠO VÀ LƯU PIPELINE
-    # ============================================================
-    print(f"\n💾 Creating complete pipeline...")
+    print(f"\n Creating complete pipeline...")
     
-    # Tạo scaler từ mean/std đã tính
     from pymo.preprocessing import ListStandardScaler
     scaler = ListStandardScaler()
     scaler.data_mean_ = mean
     scaler.data_std_ = std
     
-    # Tạo Numpyfier (cần fit một lần)
     numpyfier = Numpyfier()
-    # Fit với sample nhỏ
-    sample_for_numpyfier = const_remover.transform(
-        [sample_mocap[0]] if 'sample_mocap' in locals() else []
-    )
-    if sample_for_numpyfier:
-        numpyfier.fit(sample_for_numpyfier)
+    sample_transformed = const_remover.transform(sample_for_numpyfier_raw)
+    if sample_transformed:
+        numpyfier.fit(sample_transformed)
     
     full_pipeline = Pipeline([
         ('param', MocapParameterizer('position')),
@@ -308,26 +268,19 @@ def main_fit_scaler_efficient(parent_dir, folders=None, start=None, end=None,
     print(f"🎉 SUCCESS!")
     print(f"{'='*60}")
     print(f"   Saved: {output_filename}")
-    print(f"   Files processed: {len(all_bvh_paths)}")
-    print(f"   Final features: {mean.shape[0]}")
-    print(f"   Memory usage: STREAMING (no full load)")
+    print(f"   Total Files processed: {len(all_bvh_paths)}")
     print(f"{'='*60}")
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(
-        description='Fit global scaler with streaming (memory-efficient)'
-    )
-    parser.add_argument('--parent-dir', type=str, required=True,
-                       help='Parent directory containing numbered folders')
-    parser.add_argument('--folders', type=str,
-                       help='Comma-separated list of specific folders')
-    parser.add_argument('--start', type=int,
-                       help='Start folder number (inclusive)')
-    parser.add_argument('--end', type=int,
-                       help='End folder number (inclusive)')
-    parser.add_argument('--batch-size', type=int, default=100,
-                       help='Number of files to process per batch (default: 100)')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--parent-dir', type=str, required=True)
+    parser.add_argument('--folders', type=str)
+    parser.add_argument('--start', type=int)
+    parser.add_argument('--end', type=int)
+    parser.add_argument('--batch-size', type=int, default=100)
+    parser.add_argument('--sample-size', type=int, default=1000, 
+                        help='Number of files to sample for ConstantsRemover (Pass 1). Default: 1000')
     
     args = parser.parse_args()
 
@@ -340,9 +293,6 @@ if __name__ == '__main__':
         folders=folders_list,
         start=args.start,
         end=args.end,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        sample_size_limit=args.sample_size
     )
-
-"""
-python step1_fit_scaler.py --parent-dir ./BEAT_numpy --folders "train,val,test" --batch-size 100
-"""

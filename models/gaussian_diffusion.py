@@ -304,6 +304,8 @@ class LossType(enum.Enum):
     )  # use raw MSE loss (with RESCALED_KL when learning variances)
     KL = enum.auto()  # use the variational lower-bound
     RESCALED_KL = enum.auto()  # like KL, but rescale to estimate the full VLB
+    L1 = enum.auto()  # use L1 loss
+    RESCALED_L1 = enum.auto()  # use rescaled L1 loss
 
     def is_vb(self):
         return self == LossType.KL or self == LossType.RESCALED_KL
@@ -400,7 +402,7 @@ class GaussianDiffusion:
             pass to the model. This can be used for conditioning.
         :param noise: if specified, the specific Gaussian noise to try to remove.
         :return: a dict with the key "loss" containing a tensor of shape [N].
-                 Some mean or variance settings may also have other keys.
+                Some mean or variance settings may also have other keys.
         """
         if model_kwargs is None:
             model_kwargs = {}
@@ -443,9 +445,7 @@ class GaussianDiffusion:
                 if self.loss_type == LossType.RESCALED_MSE:
                     terms["vb"] *= self.num_timesteps / 1000.0
 
-            # =================================================================
-            # PHẦN 1: LOSS LATENT (Giữ nguyên để model học representation tốt)
-            # =================================================================
+            # Calculate target based on model mean type
             target = {
                 ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(
                     x_start=x_start, x_t=x_t, t=t
@@ -455,19 +455,18 @@ class GaussianDiffusion:
             }[self.model_mean_type]
             
             assert model_output.shape == target.shape == x_start.shape
+            
+            # Base MSE loss in latent space
             loss_latent = mean_flat((target - model_output) ** 2)
             
-            # =================================================================
-            # PHẦN 2: LOSS GEOMETRIC (Hand/Body riêng biệt trên Motion Space)
-            # =================================================================
-            # Chỉ tính nếu có đầy đủ công cụ (vq_model + indices + raw_motion)
+            # Check if hand/body loss should be computed
             if (self.vq_model is not None and 
                 self.hand_indices is not None and 
                 self.body_indices is not None and
                 'y' in model_kwargs and 
                 'raw_motion' in model_kwargs['y']):
                 
-                # Bước A: Dự đoán Latent sạch (x_0) từ output
+                # Predict clean latent (x_0) from model output
                 if self.model_mean_type == ModelMeanType.EPSILON:
                     pred_latent = self._predict_xstart_from_eps(x_t=x_t, t=t, eps=model_output)
                 elif self.model_mean_type == ModelMeanType.START_X:
@@ -475,39 +474,119 @@ class GaussianDiffusion:
                 else:  # PREVIOUS_X
                     pred_latent = self._predict_xstart_from_xprev(x_t=x_t, t=t, xprev=model_output)
                 
-                # Bước B: Decode Latent ra Motion (KHÔNG detach để gradient flow)
+                # Decode to motion space
                 pred_motion = self.vq_model.decode_from_latent(latent=pred_latent)
                 target_motion = model_kwargs['y']['raw_motion']
                 
-                # Kiểm tra shape
                 assert pred_motion.shape == target_motion.shape, \
                     f"Shape mismatch: pred={pred_motion.shape}, target={target_motion.shape}"
                 
-                # Bước C: Tính MSE cho từng frame
-                # Shape: (B, T, 264)
+                # Compute MSE per frame
                 diff_motion = (pred_motion - target_motion) ** 2
                 
-                # Bước D: Tách loss Hand và Body
-                # hand_indices: array các index cột thuộc tay (ví dụ [0,1,2,...,89])
-                # body_indices: array các index cột thuộc thân (ví dụ [90,91,...,263])
-                
+                # Separate hand and body losses
                 loss_hand = diff_motion[:, :, self.hand_indices].mean()
                 loss_body = diff_motion[:, :, self.body_indices].mean()
                 
-                # Bước E: Tổng hợp Loss
-                # Loss = Loss_Latent + Loss_Body + (Weight * Loss_Hand)
-                terms["loss"] = loss_latent + (self.hand_loss_weight * loss_hand)
+                # Combined loss: Latent + Body + Weighted Hand
+                terms["loss"] = loss_latent + loss_body + (self.hand_loss_weight * loss_hand)
                 
-                # Lưu lại các loss riêng để logging (optional)
+                # Store individual losses for logging
                 terms["loss_latent"] = loss_latent.detach()
                 terms["loss_hand"] = loss_hand.detach()
-                # terms["loss_body"] = loss_body.detach()
-                
+                terms["loss_body"] = loss_body.detach()
             else:
-                # Nếu không có config hand/body, chạy như cũ
+                # No hand/body weighting
                 terms["loss"] = loss_latent
             
-            # Lưu target và pred để debug (optional)
+            # Add variance loss if applicable
+            if "vb" in terms:
+                terms["loss"] = terms["loss"] + terms["vb"]
+            
+            # Store for debugging
+            terms["mse"] = loss_latent
+            terms["target"] = target
+            terms["pred"] = model_output
+        
+        elif self.loss_type == LossType.L1 or self.loss_type == LossType.RESCALED_L1:
+            model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
+
+            if self.model_var_type in [
+                ModelVarType.LEARNED,
+                ModelVarType.LEARNED_RANGE,
+            ]:
+                B, C = x_t.shape[:2]
+                assert model_output.shape == (B, C * 2, *x_t.shape[2:])
+                model_output, model_var_values = th.split(model_output, C, dim=1)
+                frozen_out = th.cat([model_output.detach(), model_var_values], dim=1)
+                terms["vb"] = self._vb_terms_bpd(
+                    model=lambda *args, r=frozen_out: r,
+                    x_start=x_start,
+                    x_t=x_t,
+                    t=t,
+                    clip_denoised=False,
+                )["output"]
+                if self.loss_type == LossType.RESCALED_L1:
+                    terms["vb"] *= self.num_timesteps / 1000.0
+
+            # Calculate target
+            target = {
+                ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(
+                    x_start=x_start, x_t=x_t, t=t
+                )[0],
+                ModelMeanType.START_X: x_start,
+                ModelMeanType.EPSILON: noise,
+            }[self.model_mean_type]
+            
+            assert model_output.shape == target.shape == x_start.shape
+            
+            # Base L1 loss in latent space
+            loss_latent = mean_flat((target - model_output).abs())
+            
+            # Check if hand/body loss should be computed
+            if (self.vq_model is not None and 
+                self.hand_indices is not None and 
+                self.body_indices is not None and
+                'y' in model_kwargs and 
+                'raw_motion' in model_kwargs['y']):
+                
+                # Predict clean latent
+                if self.model_mean_type == ModelMeanType.EPSILON:
+                    pred_latent = self._predict_xstart_from_eps(x_t=x_t, t=t, eps=model_output)
+                elif self.model_mean_type == ModelMeanType.START_X:
+                    pred_latent = model_output
+                else:  # PREVIOUS_X
+                    pred_latent = self._predict_xstart_from_xprev(x_t=x_t, t=t, xprev=model_output)
+                
+                # Decode to motion space
+                pred_motion = self.vq_model.decode_from_latent(latent=pred_latent)
+                target_motion = model_kwargs['y']['raw_motion']
+                
+                assert pred_motion.shape == target_motion.shape
+                
+                # L1 loss in motion space
+                diff_motion = (pred_motion - target_motion).abs()
+                
+                # Separate hand and body
+                loss_hand = diff_motion[:, :, self.hand_indices].mean()
+                loss_body = diff_motion[:, :, self.body_indices].mean()
+                
+                # Combined loss
+                terms["loss"] = loss_latent + loss_body + (self.hand_loss_weight * loss_hand)
+                
+                # Logging
+                terms["loss_latent"] = loss_latent.detach()
+                terms["loss_hand"] = loss_hand.detach()
+                terms["loss_body"] = loss_body.detach()
+            else:
+                terms["loss"] = loss_latent
+            
+            # Add variance loss
+            if "vb" in terms:
+                terms["loss"] = terms["loss"] + terms["vb"]
+            
+            # Store for debugging
+            terms["l1"] = loss_latent
             terms["target"] = target
             terms["pred"] = model_output
             

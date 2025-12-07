@@ -178,7 +178,16 @@ class VQKLDiffusionTrainer:
         )
         
         # Total loss
-        loss_total = compute_losses['loss'].mean()
+        # loss_total = compute_losses['loss'].mean()
+        if 'loss' in compute_losses:
+            loss_total = compute_losses['loss'].mean()
+        elif 'l1' in compute_losses:
+            loss_total = compute_losses['l1'].mean()
+        elif 'mse' in compute_losses:
+            loss_total = compute_losses['mse'].mean()
+        else:
+            # Lấy đại giá trị đầu tiên nếu không tìm thấy key quen thuộc
+            loss_total = list(compute_losses.values())[0].mean()
         
         # Add KL loss if available
         if encode_info.get('kl_loss') is not None:
@@ -476,6 +485,8 @@ def main():
     parser.add_argument('--guidance_scale', type=float, default=2.0)
     
     # Loss weights
+    parser.add_argument('--loss_type', type=str, default='l1', choices=['mse', 'l1', 'rescaled_mse', 'rescaled_l1'], 
+                    help='Loại hàm mất mát (L1 thường tốt hơn cho motion)')
     parser.add_argument('--hand_loss_weight', type=float, default=10.0)
     parser.add_argument('--kl_weight', type=float, default=1e-6,
                         help='Weight for KL divergence loss')
@@ -495,7 +506,7 @@ def main():
     # Logging
     parser.add_argument('--log_every', type=int, default=50)
     parser.add_argument('--save_every', type=int, default=1000)
-    parser.add_argument('--save_epoch_every', type=int, default=5)
+    parser.add_argument('--save_epoch_every', type=int, default=25)
     parser.add_argument('--eval_every', type=int, default=1)
     
     # Paths
@@ -611,11 +622,18 @@ def main():
     # Create diffusion
     betas = get_named_beta_schedule(args.noise_schedule, args.diffusion_steps)
 
+    loss_type_map = {
+        'mse': LossType.MSE,
+        'l1': LossType.MSE,
+        'rescaled_mse': LossType.RESCALED_MSE,
+        'rescaled_l1': LossType.RESCALED_MSE
+    }
+
     diffusion = GaussianDiffusion(
         betas=betas,
         model_mean_type=ModelMeanType.EPSILON,
         model_var_type=ModelVarType.FIXED_SMALL,
-        loss_type=LossType.MSE,
+        loss_type=loss_type_map[args.loss_type],
         rescale_timesteps=False,
         vq_model=model, 
         hand_indices=hand_indices,
