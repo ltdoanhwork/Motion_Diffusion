@@ -1,6 +1,10 @@
 """
-Training script for VQ-KL Autoencoder with GAN + Perceptual Loss
-Combines: VQ + KL + LPIPS + Discriminator
+Training script for Enhanced VQ-KL Autoencoder with:
+- GAN + Perceptual Loss (LPIPS)
+- Hierarchical Weighted Loss
+- Sobolev Regularization
+- Spectral Loss
+- Geometric Consistency
 """
 import os
 import sys
@@ -22,7 +26,12 @@ if PYMO_DIR not in sys.path:
 
 # --- 2. IMPORT TỪ DỰ ÁN ---
 from models.vq.model import RVQVAE
-from trainers.vq_trainer_gan import RVQTokenizerTrainerGAN
+from trainers.vq_trainer_gan import (
+    RVQTokenizerTrainerGAN,
+    create_trainer_from_config,
+    get_smpl_bone_pairs,
+    get_hand_joint_indices
+)
 from datasets.dataset import Beat2MotionDataset as DatasetClass
 from utils.fixseed import fixseed
 
@@ -99,12 +108,12 @@ class DummyOpt:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train VQ-KL with GAN + Perceptual Loss')
+    parser = argparse.ArgumentParser(description='Train Enhanced VQ-KL with GAN')
     
     # ==================== Paths ====================
     parser.add_argument('--checkpoints_dir', type=str, default='./checkpoints',
                         help='Thư mục gốc lưu checkpoints')
-    parser.add_argument('--name', type=str, default='VQKL_GAN_BEAT',
+    parser.add_argument('--name', type=str, default='VQKL_Enhanced_BEAT',
                         help='Tên thử nghiệm')
     parser.add_argument('--dataset_name', type=str, default='beat', 
                         choices=['t2m', 'kit', 'beat'])
@@ -134,10 +143,9 @@ def main():
     parser.add_argument('--is_continue', action='store_true')
     parser.add_argument('--num_workers', type=int, default=4)
     
-    # ==================== Loss Weights ====================
+    # ==================== Base Loss Weights ====================
     parser.add_argument('--recons_loss', type=str, default='l1', 
                         choices=['l1', 'l1_smooth', 'l2'])
-    parser.add_argument('--loss_vel', type=float, default=0.1)
     parser.add_argument('--commit', type=float, default=0.02,
                         help='VQ commitment loss weight')
     parser.add_argument('--kl_weight', type=float, default=1e-6,
@@ -157,6 +165,32 @@ def main():
                         help='Số layers trong discriminator')
     parser.add_argument('--disc_in_channels', type=int, default=264,
                         help='Input channels cho discriminator (= dim_pose)')
+    
+    # ==================== Enhanced Loss Parameters ====================
+    # Hierarchical Loss
+    parser.add_argument('--use_hierarchical_loss', action='store_true', default=True,
+                        help='Enable hierarchical weighting for hand joints')
+    parser.add_argument('--hand_loss_weight', type=float, default=3.0,
+                        help='Weight multiplier for hand reconstruction loss (α)')
+    parser.add_argument('--skeleton_type', type=str, default='smpl',
+                        choices=['smpl', 'cmu'],
+                        help='Skeleton type for joint mapping')
+    
+    # Sobolev Regularization
+    parser.add_argument('--lambda_vel', type=float, default=0.5,
+                        help='Weight for velocity loss (first derivative)')
+    parser.add_argument('--lambda_acc', type=float, default=0.3,
+                        help='Weight for acceleration loss (second derivative)')
+    
+    # Spectral Loss
+    parser.add_argument('--lambda_spectral', type=float, default=0.1,
+                        help='Weight for spectral/frequency domain loss')
+    
+    # Geometric Consistency
+    parser.add_argument('--use_bone_loss', action='store_true', default=True,
+                        help='Enable bone length consistency loss')
+    parser.add_argument('--lambda_bone', type=float, default=0.15,
+                        help='Weight for bone length preservation loss')
     
     # ==================== Training Schedule ====================
     parser.add_argument('--warm_up_iter', type=int, default=1000)
@@ -179,13 +213,19 @@ def main():
     args.is_train = True
     args.device = torch.device(f'cuda:{args.gpu_id}' if torch.cuda.is_available() else 'cpu')
     
-    print("\n" + "="*70)
-    print("VQ-KL + GAN + PERCEPTUAL LOSS TRAINING")
-    print("="*70)
+    print("\n" + "="*80)
+    print("🚀 ENHANCED VQ-KL + GAN TRAINING")
+    print("="*80)
     print(f"Device: {args.device}")
     print(f"Architecture: VQ + KL + LPIPS + Discriminator")
+    print(f"Enhanced with:")
+    print(f"  ✓ Hierarchical Loss (hands)")
+    print(f"  ✓ Sobolev Regularization (velocity + acceleration)")
+    print(f"  ✓ Spectral Loss (frequency domain)")
+    if args.use_bone_loss:
+        print(f"  ✓ Geometric Consistency (bone lengths)")
     print(f"Dataset: {args.dataset_name.upper()}")
-    print("="*70 + "\n")
+    print("="*80 + "\n")
 
     # ==================== Directories ====================
     args.save_root = pjoin(args.checkpoints_dir, args.dataset_name, args.name)
@@ -247,7 +287,7 @@ def main():
     print(f"[INFO] ✓ Val: {len(val_dataset)} samples")
 
     # ==================== Model ====================
-    print("\n[INFO] Initializing VQ-KL + GAN Model...")
+    print("\n[INFO] Initializing VQ-KL Model...")
     args.num_quantizers = args.num_codebooks
     args.shared_codebook = False
     args.quantize_dropout_prob = 0.0
@@ -258,14 +298,6 @@ def main():
     print(f"  - VQ codebook dim: {args.codebook_dim}")
     print(f"  - KL embed dim: {args.embed_dim}")
     print(f"  - Num quantizers: {args.num_codebooks}")
-    print(f"  - Discriminator starts at iter: {args.disc_start}")
-    print(f"\n[INFO] Loss weights:")
-    print(f"  - Reconstruction: 1.0 ({args.recons_loss})")
-    print(f"  - Velocity: {args.loss_vel}")
-    print(f"  - VQ Commitment: {args.commit}")
-    print(f"  - KL: {args.kl_weight}")
-    print(f"  - Discriminator: {args.disc_weight}")
-    print(f"  - Perceptual (LPIPS): {args.perceptual_weight}")
 
     model = RVQVAE(
         args,
@@ -287,57 +319,59 @@ def main():
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"\n[INFO] ✓ Model: {total_params/1e6:.2f}M parameters")
 
-    # ==================== Trainer with GAN ====================
-    print("\n[INFO] Initializing Trainer with GAN...")
+    # ==================== Enhanced Trainer ====================
+    print("\n[INFO] Initializing Enhanced Trainer with GAN...")
+    print(f"\n[INFO] Loss Configuration:")
+    print(f"  Base Losses:")
+    print(f"    - Reconstruction: 1.0 ({args.recons_loss})")
+    print(f"    - VQ Commitment: {args.commit}")
+    print(f"    - KL Divergence: {args.kl_weight}")
+    print(f"  GAN Losses:")
+    print(f"    - Discriminator: {args.disc_weight} (starts at iter {args.disc_start})")
+    print(f"    - Perceptual (LPIPS): {args.perceptual_weight}")
+    print(f"  Enhanced Losses:")
+    if args.use_hierarchical_loss:
+        print(f"    - Hierarchical (hand α): {args.hand_loss_weight}")
+    print(f"    - Sobolev Velocity: {args.lambda_vel}")
+    print(f"    - Sobolev Acceleration: {args.lambda_acc}")
+    print(f"    - Spectral (FFT): {args.lambda_spectral}")
+    if args.use_bone_loss:
+        bone_pairs = get_smpl_bone_pairs() if args.skeleton_type == 'smpl' else []
+        print(f"    - Geometric ({len(bone_pairs)} bones): {args.lambda_bone}")
     
-    trainer = RVQTokenizerTrainerGAN(
-        args,
-        model,
-        kl_weight=args.kl_weight,
-        use_posterior_sample=args.use_posterior_sample,
-        # GAN parameters
-        disc_start=args.disc_start,
-        disc_weight=args.disc_weight,
-        disc_factor=args.disc_factor,
-        perceptual_weight=args.perceptual_weight,
-        disc_loss=args.disc_loss,
-        disc_num_layers=args.disc_num_layers,
-        disc_in_channels=args.disc_in_channels
-    )
+    # Use factory function to create trainer
+    trainer = create_trainer_from_config(args, model)
     
-    print("[INFO] ✓ Trainer ready")
+    print("\n[INFO] ✓ Enhanced Trainer ready!")
 
     # ==================== Training ====================
-    print("\n" + "="*70)
-    print("STARTING TRAINING")
-    print("="*70)
+    print("\n" + "="*80)
+    print("📊 STARTING TRAINING")
+    print("="*80)
     print(f"Max epochs: {args.max_epoch}")
     print(f"Batch size: {args.batch_size}")
-    print(f"Generator LR: {args.lr}")
-    print(f"Discriminator LR: {args.lr_disc}")
+    print(f"Generator LR: {args.lr} (Cosine Annealing)")
+    print(f"Discriminator LR: {args.lr_disc} (Cosine Annealing)")
     print(f"Mode: {'Continue' if args.is_continue else 'From scratch'}")
-    print("="*70 + "\n")
+    print("="*80 + "\n")
     
     trainer.train(
         train_loader,
-        val_loader=val_loader,
-        eval_val_loader=None,
-        eval_wrapper=None,
-        plot_eval=None
+        val_loader=val_loader
     )
     
     # ==================== Complete ====================
-    print("\n" + "="*70)
-    print("TRAINING COMPLETED!")
-    print("="*70)
-    print(f"Model: {args.model_dir}")
-    print(f"Logs: {args.log_dir}")
-    print("\nNext steps:")
+    print("\n" + "="*80)
+    print("✅ TRAINING COMPLETED!")
+    print("="*80)
+    print(f"Model saved: {args.model_dir}")
+    print(f"Logs saved: {args.log_dir}")
+    print("\n📝 Next steps:")
     print(f"1. Calculate scale_factor:")
     print(f"   python tools/calculate_scale_factor.py --vqkl_name {args.name}")
     print(f"2. Train diffusion:")
     print(f"   python tools/train_vqkl_diffusion.py --vqkl_name {args.name}")
-    print("="*70 + "\n")
+    print("="*80 + "\n")
 
 
 if __name__ == "__main__":

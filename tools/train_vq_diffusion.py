@@ -1,7 +1,9 @@
 """
 Training script for VQ-KL Latent Diffusion
 Uses hybrid VQ-KL autoencoder with diffusion in latent space
-Updated with Sobolev Norm (High-order derivative loss)
+Updated with:
+- Sobolev Norm (High-order derivative loss in latent space)
+- Physical Space Losses (Reconstruction, Velocity, Foot Contact)
 """
 
 import os
@@ -85,9 +87,6 @@ def sobolev_loss(pred, target, depth=2):
         depth: Number of derivatives to calculate (1=velocity, 2=acceleration)
     """
     loss = 0.0
-    # Note: 0-th order (Position) is usually covered by the main reconstruction loss (L1/MSE/KL)
-    # We focus on derivatives here.
-    
     curr_pred = pred
     curr_target = target
     
@@ -95,7 +94,7 @@ def sobolev_loss(pred, target, depth=2):
         if curr_pred.shape[1] < 2:
             break
             
-        # Calculate finite difference (derivative proxy) along time dimension (dim=1)
+        # Calculate finite difference (derivative proxy) along time dimension
         curr_pred = curr_pred[:, 1:] - curr_pred[:, :-1]
         curr_target = curr_target[:, 1:] - curr_target[:, :-1]
         
@@ -105,8 +104,42 @@ def sobolev_loss(pred, target, depth=2):
     return loss
 
 
+def compute_bone_lengths(motion, bone_pairs):
+    """
+    Compute bone lengths from motion data
+    Args:
+        motion: (B, T, J*3) or (B, T, J, 3)
+        bone_pairs: List of (parent_idx, child_idx) tuples
+    Returns:
+        bone_lengths: (B, T, num_bones)
+    """
+    if motion.dim() == 3:
+        B, T, D = motion.shape
+        J = D // 3
+        motion = motion.reshape(B, T, J, 3)
+    
+    bone_lengths = []
+    for parent_idx, child_idx in bone_pairs:
+        parent_pos = motion[:, :, parent_idx, :]  # (B, T, 3)
+        child_pos = motion[:, :, child_idx, :]    # (B, T, 3)
+        bone_vec = child_pos - parent_pos
+        bone_len = torch.norm(bone_vec, dim=-1)   # (B, T)
+        bone_lengths.append(bone_len)
+    
+    return torch.stack(bone_lengths, dim=-1)  # (B, T, num_bones)
+
+
+def bone_length_loss(pred_motion, target_motion, bone_pairs):
+    """
+    Bone length consistency loss
+    """
+    pred_lengths = compute_bone_lengths(pred_motion, bone_pairs)
+    target_lengths = compute_bone_lengths(target_motion, bone_pairs)
+    return F.l1_loss(pred_lengths, target_lengths)
+
+
 class VQKLDiffusionTrainer:
-    """Trainer for VQ-KL Latent Diffusion with CFG support"""
+    """Trainer for VQ-KL Latent Diffusion with CFG and Physical Space Losses"""
     
     def __init__(self, args, model, diffusion, data_loader, val_loader=None):
         self.args = args
@@ -151,9 +184,16 @@ class VQKLDiffusionTrainer:
         print(f"  - Hand loss weight: {args.hand_loss_weight}")
         if args.sobolev_loss_weight > 0:
             print(f"  - Sobolev Loss Enabled: weight={args.sobolev_loss_weight}, depth={args.sobolev_depth}")
+        if args.physical_loss_weight > 0:
+            print(f"  - Physical Space Losses Enabled:")
+            print(f"    * Reconstruction weight: {args.physical_loss_weight}")
+            print(f"    * Velocity weight: {args.physical_loss_weight * 1.5}")
+            print(f"    * Foot contact weight: {args.physical_loss_weight * 2.0}")
+            if args.use_bone_loss:
+                print(f"    * Bone length weight: {args.lambda_bone}")
     
     def train_step(self, batch):
-        """Single training step with CFG and optional hand boosting"""
+        """Single training step with CFG, Physical Space Losses"""
         self.model.train()
         
         # Unpack batch
@@ -210,7 +250,7 @@ class VQKLDiffusionTrainer:
             model_kwargs=model_kwargs
         )
         
-        # Base Diffusion Loss
+        # 1. Base Diffusion Loss (Latent Space)
         if 'loss' in compute_losses:
             loss_total = compute_losses['loss'].mean()
         elif 'l1' in compute_losses:
@@ -218,32 +258,93 @@ class VQKLDiffusionTrainer:
         elif 'mse' in compute_losses:
             loss_total = compute_losses['mse'].mean()
         else:
-            # Fallback
             loss_total = list(compute_losses.values())[0].mean()
         
-        # --- Add Sobolev Loss (Temporal Smoothness) ---
+        # Initialize loss tracking
         sob_loss_val = 0.0
+        rec_loss_val = 0.0
+        vel_loss_val = 0.0
+        foot_slide_loss_val = 0.0
+        bone_loss_val = 0.0
+        
+        # 2. Sobolev Loss (Temporal Smoothness in Latent Space)
         if self.args.sobolev_loss_weight > 0:
-            # We need the predicted x_start (clean latent) to calculate smoothness
-            # Most diffusion implementations return 'pred_xstart' in the losses dict
             pred_xstart = compute_losses.get('pred_xstart')
             
             if pred_xstart is not None:
-                # Calculate Sobolev loss between Predicted Latent and Ground Truth Latent
                 sob_loss = sobolev_loss(pred_xstart, latent, depth=self.args.sobolev_depth)
                 loss_total = loss_total + self.args.sobolev_loss_weight * sob_loss
                 sob_loss_val = sob_loss.item()
             else:
-                # If prediction is not available (e.g., simpler diffusion impl), try model_output
-                # Only if model predicts X_START (not EPSILON)
+                # Fallback to model_output if pred_xstart not available
                 if self.diffusion.model_mean_type == ModelMeanType.START_X:
                     model_output = compute_losses.get('model_output')
                     if model_output is not None:
                         sob_loss = sobolev_loss(model_output, latent, depth=self.args.sobolev_depth)
                         loss_total = loss_total + self.args.sobolev_loss_weight * sob_loss
                         sob_loss_val = sob_loss.item()
-
-        # Add KL loss if available
+        
+        # ==================================================================
+        # 3. PHYSICAL SPACE LOSSES
+        # Only apply if pred_xstart is available and weight > 0
+        # ==================================================================
+        pred_xstart = compute_losses.get('pred_xstart')
+        
+        if pred_xstart is not None and self.args.physical_loss_weight > 0:
+            # A. Decode Latent prediction to Physical Motion
+            # Gradient flows through the latent (decoder is frozen)
+            recon_motion = self.model.decode_from_latent(pred_xstart)
+            
+            # B. Create mask for valid frames (ignore padding)
+            mask = torch.zeros_like(motion)
+            for i, length in enumerate(m_lens):
+                mask[i, :length, :] = 1.0
+            
+            # C. Physical Reconstruction Loss (L1)
+            rec_loss = F.l1_loss(recon_motion * mask, motion * mask)
+            loss_total += self.args.physical_loss_weight * rec_loss
+            rec_loss_val = rec_loss.item()
+            
+            # D. Physical Velocity Loss (Temporal Smoothness in Physical Space)
+            if recon_motion.shape[1] > 1:
+                vel_recon = recon_motion[:, 1:] - recon_motion[:, :-1]
+                vel_target = motion[:, 1:] - motion[:, :-1]
+                vel_loss = F.l1_loss(vel_recon * mask[:, 1:], vel_target * mask[:, 1:])
+                loss_total += (self.args.physical_loss_weight * 1.5) * vel_loss
+                vel_loss_val = vel_loss.item()
+            
+            # E. Foot Contact Consistency (Reduce foot sliding)
+            if hasattr(self.args, 'foot_indices') and self.args.foot_indices is not None:
+                foot_indices = self.args.foot_indices
+                
+                if recon_motion.shape[1] > 1:
+                    # Reshape to (B, T, J, 3) if needed
+                    D = motion.shape[-1]
+                    J = D // 3
+                    
+                    recon_reshaped = recon_motion.reshape(B, -1, J, 3)
+                    motion_reshaped = motion.reshape(B, -1, J, 3)
+                    
+                    # Extract foot velocities
+                    foot_vel_recon = recon_reshaped[:, 1:, foot_indices] - recon_reshaped[:, :-1, foot_indices]
+                    foot_vel_target = motion_reshaped[:, 1:, foot_indices] - motion_reshaped[:, :-1, foot_indices]
+                    
+                    # Create contact mask: where ground truth foot velocity is low
+                    contact_threshold = self.args.foot_contact_threshold
+                    contact_mask = (torch.norm(foot_vel_target, dim=-1) < contact_threshold).float()
+                    
+                    # Penalize predicted foot velocity at contact points
+                    foot_sliding_loss = (torch.norm(foot_vel_recon, dim=-1) * contact_mask).mean()
+                    loss_total += (self.args.physical_loss_weight * 2.0) * foot_sliding_loss
+                    foot_slide_loss_val = foot_sliding_loss.item()
+            
+            # F. Bone Length Consistency Loss
+            if self.args.use_bone_loss and hasattr(self.args, 'bone_pairs'):
+                bone_loss = bone_length_loss(recon_motion, motion, self.args.bone_pairs)
+                loss_total += self.args.lambda_bone * bone_loss
+                bone_loss_val = bone_loss.item()
+        
+        # 4. Add KL loss if available
         if encode_info.get('kl_loss') is not None:
             kl_loss = encode_info['kl_loss'].mean()
             loss_total = loss_total + self.args.kl_weight * kl_loss
@@ -263,11 +364,15 @@ class VQKLDiffusionTrainer:
         self.optimizer.step()
         self.scheduler.step()
         
-        # Return losses
+        # Return losses for logging
         result = {
             'loss': loss_total.item(),
             'kl_loss': kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss,
             'sobolev_loss': sob_loss_val,
+            'phys_rec_loss': rec_loss_val,
+            'phys_vel_loss': vel_loss_val,
+            'foot_slide_loss': foot_slide_loss_val,
+            'bone_loss': bone_loss_val,
             'lr': self.optimizer.param_groups[0]['lr']
         }
         
@@ -289,6 +394,7 @@ class VQKLDiffusionTrainer:
         self.model.eval()
         val_losses = []
         val_kl_losses = []
+        val_phys_losses = []
         
         for batch in self.val_loader:
             text, motion, m_lens = batch
@@ -297,7 +403,7 @@ class VQKLDiffusionTrainer:
             # Encode to latent
             latent, encode_info = self.model.encode_to_latent(
                 motion, 
-                sample_posterior=False  # Use deterministic encoding for validation
+                sample_posterior=False  # Deterministic for validation
             )
             
             B = latent.shape[0]
@@ -323,10 +429,19 @@ class VQKLDiffusionTrainer:
             
             if encode_info.get('kl_loss') is not None:
                 val_kl_losses.append(encode_info['kl_loss'].mean().item())
+            
+            # Compute physical reconstruction loss for validation
+            pred_xstart = compute_losses.get('pred_xstart')
+            if pred_xstart is not None:
+                recon_motion = self.model.decode_from_latent(pred_xstart)
+                phys_loss = F.l1_loss(recon_motion, motion)
+                val_phys_losses.append(phys_loss.item())
         
         result = {'diffusion_loss': np.mean(val_losses)}
         if val_kl_losses:
             result['kl_loss'] = np.mean(val_kl_losses)
+        if val_phys_losses:
+            result['phys_rec_loss'] = np.mean(val_phys_losses)
         
         return result
     
@@ -403,6 +518,7 @@ class VQKLDiffusionTrainer:
         print(f"CFG dropout prob: {self.args.cond_drop_prob}")
         print(f"KL weight: {self.args.kl_weight}")
         print(f"Sobolev weight: {self.args.sobolev_loss_weight}")
+        print(f"Physical loss weight: {self.args.physical_loss_weight}")
         print("="*70)
         
         best_val_loss = float('inf')
@@ -412,6 +528,8 @@ class VQKLDiffusionTrainer:
             epoch_losses = []
             epoch_kl_losses = []
             epoch_sob_losses = []
+            epoch_phys_losses = []
+            epoch_foot_losses = []
             
             # Training
             for batch_idx, batch in enumerate(self.data_loader):
@@ -421,6 +539,10 @@ class VQKLDiffusionTrainer:
                     epoch_kl_losses.append(losses['kl_loss'])
                 if losses['sobolev_loss'] > 0:
                     epoch_sob_losses.append(losses['sobolev_loss'])
+                if losses['phys_rec_loss'] > 0:
+                    epoch_phys_losses.append(losses['phys_rec_loss'])
+                if losses['foot_slide_loss'] > 0:
+                    epoch_foot_losses.append(losses['foot_slide_loss'])
                 
                 self.global_step += 1
                 
@@ -429,15 +551,23 @@ class VQKLDiffusionTrainer:
                     avg_loss = np.mean(epoch_losses[-self.args.log_every:])
                     
                     log_str = f"Epoch: {epoch:03d} | Step: {self.global_step:06d} | Loss: {avg_loss:.4f}"
+                    
                     if epoch_kl_losses:
                         avg_kl = np.mean(epoch_kl_losses[-self.args.log_every:])
                         log_str += f" | KL: {avg_kl:.6f}"
                     if epoch_sob_losses:
                         avg_sob = np.mean(epoch_sob_losses[-self.args.log_every:])
                         log_str += f" | Sob: {avg_sob:.6f}"
+                    if epoch_phys_losses:
+                        avg_phys = np.mean(epoch_phys_losses[-self.args.log_every:])
+                        log_str += f" | Phys: {avg_phys:.4f}"
+                    if epoch_foot_losses:
+                        avg_foot = np.mean(epoch_foot_losses[-self.args.log_every:])
+                        log_str += f" | Foot: {avg_foot:.6f}"
                     if 'loss_hand' in losses:
                         log_str += f" | Hand: {losses['loss_hand']:.4f}"
                     log_str += f" | LR: {losses['lr']:.8f}"
+                    
                     print(log_str)
                     
                     # Tensorboard
@@ -447,8 +577,16 @@ class VQKLDiffusionTrainer:
                         self.logger.add_scalar('train/kl_loss', avg_kl, self.global_step)
                     if epoch_sob_losses:
                         self.logger.add_scalar('train/sobolev_loss', avg_sob, self.global_step)
+                    if epoch_phys_losses:
+                        self.logger.add_scalar('train/phys_rec_loss', avg_phys, self.global_step)
+                    if epoch_foot_losses:
+                        self.logger.add_scalar('train/foot_slide_loss', avg_foot, self.global_step)
                     if 'loss_hand' in losses:
                         self.logger.add_scalar('train/loss_hand', losses['loss_hand'], self.global_step)
+                    if losses['phys_vel_loss'] > 0:
+                        self.logger.add_scalar('train/phys_vel_loss', losses['phys_vel_loss'], self.global_step)
+                    if losses['bone_loss'] > 0:
+                        self.logger.add_scalar('train/bone_loss', losses['bone_loss'], self.global_step)
                 
                 # Save periodic checkpoint
                 if self.global_step % self.args.save_every == 0:
@@ -464,6 +602,9 @@ class VQKLDiffusionTrainer:
                 if 'kl_loss' in val_results:
                     self.logger.add_scalar('val/kl_loss', val_results['kl_loss'], self.global_step)
                     log_str += f" | Val KL: {val_results['kl_loss']:.6f}"
+                if 'phys_rec_loss' in val_results:
+                    self.logger.add_scalar('val/phys_rec_loss', val_results['phys_rec_loss'], self.global_step)
+                    log_str += f" | Val Phys: {val_results['phys_rec_loss']:.4f}"
                 print(log_str)
 
                 # Save best model
@@ -548,20 +689,29 @@ def main():
     parser.add_argument('--cond_drop_prob', type=float, default=0.1)
     parser.add_argument('--guidance_scale', type=float, default=2.0)
     
-    # Loss weights
-    parser.add_argument('--loss_type', type=str, default='l1', choices=['mse', 'l1', 'rescaled_mse', 'rescaled_l1'], 
-                    help='Loại hàm mất mát (L1 thường tốt hơn cho motion)')
+    # Loss weights - Latent Space
+    parser.add_argument('--loss_type', type=str, default='l1', choices=['mse', 'l1', 'rescaled_mse', 'rescaled_l1'])
     parser.add_argument('--hand_loss_weight', type=float, default=10.0)
-    parser.add_argument('--kl_weight', type=float, default=1e-6,
-                        help='Weight for KL divergence loss')
-    parser.add_argument('--hand_boost_factor', type=float, default=1.0,
-                        help='Signal boost factor for hand joints during encoding')
+    parser.add_argument('--kl_weight', type=float, default=1e-6)
+    parser.add_argument('--hand_boost_factor', type=float, default=1.0)
     
-    # Sobolev Loss Args
-    parser.add_argument('--sobolev_loss_weight', type=float, default=0.0,
-                        help='Weight for Sobolev (derivative) loss. 0.0 to disable.')
+    # Sobolev Loss (Latent Space Smoothness)
+    parser.add_argument('--sobolev_loss_weight', type=float, default=0.1,
+                        help='Weight for Sobolev loss in latent space. 0.0 to disable.')
     parser.add_argument('--sobolev_depth', type=int, default=2,
-                        help='Depth of Sobolev loss (1 for velocity, 2 for acceleration)')
+                        help='Depth of derivatives (1=velocity, 2=acceleration)')
+    
+    # Physical Space Losses
+    parser.add_argument('--physical_loss_weight', type=float, default=0.5,
+                        help='Base weight for physical space losses (rec, vel, foot). 0.0 to disable.')
+    parser.add_argument('--foot_contact_threshold', type=float, default=0.005,
+                        help='Velocity threshold for foot contact detection')
+    
+    # Bone Length Loss
+    parser.add_argument('--use_bone_loss', action='store_true', default=False,
+                        help='Enable bone length consistency loss')
+    parser.add_argument('--lambda_bone', type=float, default=0.1,
+                        help='Weight for bone length loss')
     
     # Sampler
     parser.add_argument('--sampler', type=str, default='ddim', choices=['ddpm', 'ddim'])
@@ -610,6 +760,47 @@ def main():
         args.joints_num = 55
         args.max_motion_length = 360
         dim_pose = 264
+        
+        # Define foot indices for BEAT (adjust based on your skeleton)
+        # Example: ankle and toe joints
+        args.foot_indices = [20, 21, 22, 23]  # Left/Right ankles and toes
+        
+        # Define bone pairs for bone length loss (parent_idx, child_idx)
+        # Example bones for consistency check
+        args.bone_pairs = bone_pairs = [
+            # Spine
+            (0, 1),   # Pelvis -> L_Hip
+            (0, 2),   # Pelvis -> R_Hip
+            (0, 3),   # Pelvis -> Spine1
+            (3, 6),   # Spine1 -> Spine2
+            (6, 9),   # Spine2 -> Spine3
+            (9, 12),  # Spine3 -> Neck
+            (12, 15), # Neck -> Head
+            
+            # Left Leg
+            (1, 4),   # L_Hip -> L_Knee
+            (4, 7),   # L_Knee -> L_Ankle
+            (7, 10),  # L_Ankle -> L_Foot
+            
+            # Right Leg
+            (2, 5),   # R_Hip -> R_Knee
+            (5, 8),   # R_Knee -> R_Ankle
+            (8, 11),  # R_Ankle -> R_Foot
+            
+            # Left Arm
+            (9, 13),  # Spine3 -> L_Collar
+            (13, 16), # L_Collar -> L_Shoulder
+            (16, 18), # L_Shoulder -> L_Elbow
+            (18, 20), # L_Elbow -> L_Wrist
+            (20, 22), # L_Wrist -> L_Hand
+            
+            # Right Arm
+            (9, 14),  # Spine3 -> R_Collar
+            (14, 17), # R_Collar -> R_Shoulder
+            (17, 19), # R_Shoulder -> R_Elbow
+            (19, 21), # R_Elbow -> R_Wrist
+            (21, 23), # R_Wrist -> R_Hand
+        ]
     else:
         raise NotImplementedError(f"Dataset {args.dataset_name} not implemented")
     
