@@ -12,25 +12,25 @@ out_dir = "/home/serverai/ltdoanh/Motion_Diffusion/datasets/BEAT_numpy"
 #     command2 = f'python "./datasets/preprocess_data.py" --parent-dir "{base_dir}" --out-root "{out_dir}" --folders "{i}" --fps 60'
 #     os.system(command2)
 
-# print("Đang chạy train_vq_with_discriminator.py...")
-# command3 = f'python ./tools/train_vq_with_discriminator.py \
-#             --name VQKL_GAN_BEAT \
-#             --batch_size 32 \
-#             --max_epoch 50 \
-#             --disc_start 10000 \
-#             --disc_weight 0.75 \
-#             --perceptual_weight 0.1 \
-#             --kl_weight 1e-6'
+print("Đang chạy train_vq_with_discriminator.py...")
+command3 = f'python ./tools/train_vq_with_discriminator.py \
+            --name VQKL_GAN_BEAT_SO \
+            --batch_size 32 \
+            --max_epoch 50 \
+            --disc_start 7500 \
+            --disc_weight 0.75 \
+            --perceptual_weight 0.1 \
+            --kl_weight 1e-6'
 
-# os.system(command3)
+os.system(command3)
 
-# print("Đang chạy scale_factor.py...")
-# command4 = f'python ./tools/scale_factor.py \
-#             --vqvae_name VQKL_GAN_BEAT'
+print("Đang chạy scale_factor.py...")
+command4 = f'python ./tools/scale_factor.py \
+            --vqvae_name VQKL_GAN_BEAT_SO'
 
-# os.system(command4)
+os.system(command4)
 
-scale_factor_path = "./checkpoints/beat/VQKL_GAN_BEAT/scale_factor.txt" 
+scale_factor_path = "./checkpoints/beat/VQKL_GAN_BEAT_SO/scale_factor.txt" 
 scale_val = None
 
 print(f"Đang đọc giá trị từ {scale_factor_path}...")
@@ -57,10 +57,10 @@ print("Đang chạy train_vq_diffusion.py...")
 
 command5 = f'python tools/train_vq_diffusion.py \
             --dataset_name beat \
-            --name vqkl_diffusion_stable \
-            --vqkl_name VQKL_GAN_BEAT \
+            --name vqkl_diffusion_hierarchical \
+            --vqkl_name VQKL_GAN_BEAT_SO \
             --batch_size 64 \
-            --max_epoch 1000 \
+            --max_epoch 50 \
             --lr 5e-5 \
             --weight_decay 0.0 \
             --grad_clip 0.5 \
@@ -68,8 +68,10 @@ command5 = f'python tools/train_vq_diffusion.py \
             --scale_factor {scale_val} \
             --noise_schedule linear \
             --use_kl_posterior \
-            --hand_loss_weight 20.0 \
-            --hand_boost_factor 5.0'
+            --hand_loss_weight 10.0 \
+            --hand_boost_factor 5.0 \
+            --sobolev_loss_weight 1.0 \
+            --sobolev_depth 2'
 
 print(f"Command thực thi: {command5}")
 os.system(command5)

@@ -1,6 +1,6 @@
 """
-Trainer for VQ-KL Autoencoder with GAN + Perceptual Loss
-Integrates VQLPIPSWithDiscriminator for better reconstruction quality
+Trainer for VQ-KL Autoencoder with GAN + Hierarchical Weighted Loss + Sobolev Regularization
+Fully implements spatial masking for hands and temporal smoothness constraints
 """
 import torch
 from torch.utils.data import DataLoader
@@ -13,16 +13,12 @@ import torch.optim as optim
 import time
 import numpy as np
 from collections import OrderedDict, defaultdict
-
 import os
 import sys
 
-# Import Motion-specific VQLPIPSWithDiscriminator
-# Use custom implementation for 1D motion sequences instead of 2D images
 try:
     from trainers.motion_vqperceptual import VQLPIPSWithDiscriminator
 except ImportError:
-    # Fallback to taming if custom version not available
     print("[WARNING] Using taming LPIPS - may cause dimension mismatch for motion data")
     from taming.modules.losses.vqperceptual import VQLPIPSWithDiscriminator
 
@@ -33,12 +29,10 @@ def def_value():
 
 class RVQTokenizerTrainerGAN:
     """
-    Trainer for VQ-KL Autoencoder with GAN
-    Supports:
-    - VQ codes (discrete)
-    - KL divergence (continuous posterior)
-    - LPIPS perceptual loss
-    - GAN discriminator loss
+    Enhanced VQ-KL Trainer with:
+    - Hierarchical Weighted Loss (Hand vs Body)
+    - Sobolev Regularization (Velocity + Acceleration)
+    - GAN + Perceptual Loss
     """
     
     def __init__(self, args, vq_model, 
@@ -51,20 +45,21 @@ class RVQTokenizerTrainerGAN:
                  perceptual_weight=0.1,
                  disc_loss="hinge",
                  disc_num_layers=2,
-                 disc_in_channels=264):
+                 disc_in_channels=264,
+                 # Hierarchical Loss parameters
+                 hand_indices=None,
+                 body_indices=None,
+                 hand_loss_weight=2.0,
+                 # Sobolev Loss parameters
+                 lambda_vel=0.5,
+                 lambda_acc=0.5):
         """
         Args:
-            args: Training arguments
-            vq_model: VQ-VAE or VQ-KL model
-            kl_weight: KL divergence weight
-            use_posterior_sample: Sample from posterior
-            disc_start: Iteration to start discriminator training
-            disc_weight: Discriminator loss weight
-            disc_factor: Discriminator loss factor
-            perceptual_weight: LPIPS perceptual loss weight
-            disc_loss: Discriminator loss type (hinge/vanilla)
-            disc_num_layers: Number of discriminator layers
-            disc_in_channels: Input channels for discriminator
+            hand_indices: torch.Tensor of shape (N_hand,) containing indices of hand features
+            body_indices: torch.Tensor of shape (N_body,) containing indices of body features
+            hand_loss_weight: α weight for hand reconstruction (recommended 2-10)
+            lambda_vel: Weight for velocity loss (L_vel)
+            lambda_acc: Weight for acceleration loss (L_acc)
         """
         self.opt = args
         self.vq_model = vq_model
@@ -78,6 +73,26 @@ class RVQTokenizerTrainerGAN:
         # GAN parameters
         self.disc_start = disc_start
         self.use_gan = disc_weight > 0.0
+        
+        # ==================== Hierarchical Loss Setup ====================
+        self.hand_indices = hand_indices
+        self.body_indices = body_indices
+        self.hand_loss_weight = hand_loss_weight
+        
+        # Create spatial weight mask M
+        self.spatial_mask = None
+        if hand_indices is not None:
+            print(f"\n[INFO] Hierarchical Loss Configuration:")
+            print(f"  - Hand indices: {len(hand_indices)} features")
+            print(f"  - Hand weight (α): {hand_loss_weight}")
+            print(f"  - Body weight: 1.0")
+        
+        # ==================== Sobolev Loss Setup ====================
+        self.lambda_vel = lambda_vel
+        self.lambda_acc = lambda_acc
+        print(f"\n[INFO] Sobolev Regularization:")
+        print(f"  - Velocity weight (λ_vel): {lambda_vel}")
+        print(f"  - Acceleration weight (λ_acc): {lambda_acc}")
         
         print(f"\n[INFO] Trainer Configuration:")
         print(f"  - VQ-KL mode: {self.is_vqkl}")
@@ -94,13 +109,13 @@ class RVQTokenizerTrainerGAN:
         if args.is_train:
             self.logger = SummaryWriter(args.log_dir)
             
-            # Base reconstruction loss
+            # Base reconstruction loss (used in GAN)
             if args.recons_loss == 'l1':
-                self.recons_criterion = torch.nn.L1Loss()
+                self.base_recons_criterion = torch.nn.L1Loss(reduction='none')
             elif args.recons_loss == 'l1_smooth':
-                self.recons_criterion = torch.nn.SmoothL1Loss()
+                self.base_recons_criterion = torch.nn.SmoothL1Loss(reduction='none')
             elif args.recons_loss == 'l2':
-                self.recons_criterion = torch.nn.MSELoss()
+                self.base_recons_criterion = torch.nn.MSELoss(reduction='none')
             else:
                 raise ValueError(f"Unknown recons_loss: {args.recons_loss}")
             
@@ -123,17 +138,107 @@ class RVQTokenizerTrainerGAN:
                 
                 print(f"[INFO] ✓ VQLPIPSWithDiscriminator initialized")
 
-    def calculate_velocity(self, motion):
-        """Calculate motion velocity (first-order derivative)"""
-        return motion[:, 1:] - motion[:, :-1]
+    def create_spatial_mask(self, motion_shape, device):
+        """
+        Creates spatial weight mask M where M_hand = α, M_body = 1
+        
+        Args:
+            motion_shape: Shape of motion tensor (B, T, D)
+            device: torch device
+            
+        Returns:
+            mask: Tensor of shape (1, 1, D) for broadcasting
+        """
+        if self.spatial_mask is not None:
+            return self.spatial_mask
+        
+        # motion_shape is (B, T, D)
+        D = motion_shape[-1]
+        
+        # Initialize mask with ones
+        mask = torch.ones(D, device=device, dtype=torch.float32)
+        
+        # Apply hand weight
+        if self.hand_indices is not None:
+            mask[self.hand_indices] = self.hand_loss_weight
+        
+        # Reshape for broadcasting: (1, 1, D)
+        self.spatial_mask = mask.view(1, 1, -1)
+        
+        return self.spatial_mask
+
+    def hierarchical_reconstruction_loss(self, pred_motion, gt_motion):
+        """
+        Computes masked MSE loss with hierarchical weights
+        
+        L_rec = || M ⊙ (x_pred - x_gt) ||²
+        
+        where M_hand = α, M_body = 1
+        """
+        # Create mask if not exists
+        mask = self.create_spatial_mask(gt_motion.shape, gt_motion.device)
+        
+        # Compute weighted MSE
+        diff = pred_motion - gt_motion
+        weighted_diff = mask * diff
+        loss = torch.mean(weighted_diff ** 2)
+        
+        return loss
+
+    def sobolev_regularization(self, pred_motion, gt_motion):
+        """
+        Computes Sobolev regularization: velocity + acceleration penalties
+        
+        L_vel = || ∂x_pred/∂t - ∂x_gt/∂t ||²
+        L_acc = || ∂²x_pred/∂t² - ∂²x_gt/∂t² ||²
+        
+        Args:
+            pred_motion: (B, T, D) predicted motion
+            gt_motion: (B, T, D) ground truth motion
+            
+        Returns:
+            loss_vel: Velocity loss
+            loss_acc: Acceleration loss
+        """
+        # Time dimension is axis 1: (B, T, D)
+        time_dim = 1
+        
+        # 1. Velocity (First-order derivative)
+        # ∂x/∂t ≈ x[t+1] - x[t]
+        vel_pred = torch.diff(pred_motion, dim=time_dim)
+        vel_gt = torch.diff(gt_motion, dim=time_dim)
+        loss_vel = F.mse_loss(vel_pred, vel_gt)
+        
+        # 2. Acceleration (Second-order derivative)
+        # ∂²x/∂t² ≈ vel[t+1] - vel[t]
+        acc_pred = torch.diff(vel_pred, dim=time_dim)
+        acc_gt = torch.diff(vel_gt, dim=time_dim)
+        loss_acc = F.mse_loss(acc_pred, acc_gt)
+        
+        return loss_vel, loss_acc
+
+    def compute_total_reconstruction_loss(self, pred_motion, gt_motion):
+        """
+        Computes total reconstruction loss combining:
+        1. Hierarchical weighted MSE
+        2. Sobolev regularization (velocity + acceleration)
+        
+        L_total = L_rec + λ_vel * L_vel + λ_acc * L_acc
+        """
+        # 1. Hierarchical Reconstruction Loss
+        loss_rec = self.hierarchical_reconstruction_loss(pred_motion, gt_motion)
+        
+        # 2. Sobolev Regularization
+        loss_vel, loss_acc = self.sobolev_regularization(pred_motion, gt_motion)
+        
+        # 3. Combine losses
+        loss_total = loss_rec + self.lambda_vel * loss_vel + self.lambda_acc * loss_acc
+        
+        return loss_total, loss_rec, loss_vel, loss_acc
 
     def forward(self, batch_data, global_step=0, optimizer_idx=0):
         """
-        Forward pass with GAN loss
-        Args:
-            batch_data: Input batch
-            global_step: Current training iteration
-            optimizer_idx: 0 for generator, 1 for discriminator
+        Forward pass with hierarchical + Sobolev losses
         """
         motions = batch_data[1].detach().to(self.device).float()
         
@@ -177,27 +282,23 @@ class RVQTokenizerTrainerGAN:
         self.motions = motions
         self.pred_motion = pred_motion
         
-        # ==================== Loss Components ====================
+        # ==================== Enhanced Loss Computation ====================
         
-        # 1. Basic Reconstruction Loss
-        loss_rec = self.recons_criterion(pred_motion, motions)
+        # 1. Hierarchical Reconstruction + Sobolev Loss
+        loss_total_rec, loss_rec, loss_vel, loss_acc = self.compute_total_reconstruction_loss(
+            pred_motion, motions
+        )
         
-        # 2. Velocity Loss
-        gt_velocity = self.calculate_velocity(motions)
-        pred_velocity = self.calculate_velocity(pred_motion)
-        loss_vel = self.recons_criterion(pred_velocity, gt_velocity)
-        
-        # 3. VQ Commitment Loss
+        # 2. VQ Commitment Loss
         loss_commit = loss_vq
         
-        # 4. KL Loss
-        # Already computed
+        # 3. Combined reconstruction loss for GAN
+        nll_loss = loss_total_rec
         
         # ==================== GAN Loss ====================
         if self.use_gan:
-            # Reshape for discriminator: (B, T, C) -> (B, C, T)
-            # Note: motion discriminator might need temporal dimension
-            motions_disc = motions.permute(0, 2, 1)  # (B, C, T)
+            # Reshape for discriminator: (B, T, D) -> (B, D, T)
+            motions_disc = motions.permute(0, 2, 1)
             pred_motion_disc = pred_motion.permute(0, 2, 1)
             
             # Get last layer for adaptive weighting
@@ -220,41 +321,42 @@ class RVQTokenizerTrainerGAN:
             
             if optimizer_idx == 0:
                 # Generator update
-                # GAN loss already includes rec + perceptual + disc + codebook
-                # We need to add our custom losses
-                weight_vel = getattr(self.opt, 'loss_vel', 0.1)
+                # Note: GAN loss already includes basic rec + perceptual + disc + codebook
+                # We replace the basic rec with our hierarchical + Sobolev version
                 
-                loss = gan_loss + weight_vel * loss_vel
+                # Extract GAN components
+                loss_gan_g = gan_log.get('train/g_loss', torch.tensor(0.0))
+                loss_perceptual = gan_log.get('train/p_loss', torch.tensor(0.0))
+                disc_weight = gan_log.get('train/d_weight', torch.tensor(0.0))
+                disc_factor = gan_log.get('train/disc_factor', torch.tensor(0.0))
+                
+                # Reconstruct total loss with our custom reconstruction loss
+                # Original: loss = nll_loss + d_weight * disc_factor * g_loss + codebook_weight * codebook_loss
+                # Our version: Replace nll_loss with loss_total_rec
+                loss = (loss_total_rec + 
+                       disc_weight * disc_factor * loss_gan_g + 
+                       self.opt.commit * loss_commit)
                 
                 if self.is_vqkl:
                     loss = loss + self.kl_weight * loss_kl
                 
-                # Extract individual losses from GAN log for monitoring
-                loss_gan_g = gan_log.get('train/g_loss', torch.tensor(0.0))
-                loss_perceptual = gan_log.get('train/p_loss', torch.tensor(0.0))
-                disc_weight = gan_log.get('train/d_weight', torch.tensor(0.0))
-                
-                return (loss, loss_rec, loss_vel, loss_commit, perplexity, 
+                return (loss, loss_rec, loss_vel, loss_acc, loss_commit, perplexity, 
                        loss_kl, loss_gan_g, loss_perceptual, disc_weight)
             
             else:
                 # Discriminator update
-                return (gan_loss, torch.tensor(0.0), torch.tensor(0.0), 
+                return (gan_loss, torch.tensor(0.0), torch.tensor(0.0), torch.tensor(0.0),
                        torch.tensor(0.0), perplexity, torch.tensor(0.0),
                        torch.tensor(0.0), torch.tensor(0.0), torch.tensor(0.0))
         
         else:
-            # No GAN - standard training
-            weight_vel = getattr(self.opt, 'loss_vel', 0.1)
-            
-            loss = (loss_rec + 
-                   weight_vel * loss_vel + 
-                   self.opt.commit * loss_commit)
+            # No GAN - standard training with hierarchical + Sobolev
+            loss = (loss_total_rec + self.opt.commit * loss_commit)
             
             if self.is_vqkl:
                 loss = loss + self.kl_weight * loss_kl
             
-            return (loss, loss_rec, loss_vel, loss_commit, perplexity, 
+            return (loss, loss_rec, loss_vel, loss_acc, loss_commit, perplexity, 
                    loss_kl, torch.tensor(0.0), torch.tensor(0.0), torch.tensor(0.0))
 
     def update_lr_warm_up(self, nb_iter, warm_up_iter, lr):
@@ -300,7 +402,7 @@ class RVQTokenizerTrainerGAN:
 
     def train(self, train_loader, val_loader=None, eval_val_loader=None,
               eval_wrapper=None, plot_eval=None):
-        """Main training loop with GAN"""
+        """Main training loop with hierarchical + Sobolev losses"""
         self.vq_model.to(self.device)
 
         # Generator optimizer
@@ -346,6 +448,8 @@ class RVQTokenizerTrainerGAN:
         print(f'Total Epochs: {self.opt.max_epoch}')
         print(f'Total Iterations: {total_iters}')
         print(f'Discriminator starts at: {self.disc_start}')
+        print(f'Hand weight (α): {self.hand_loss_weight}')
+        print(f'Sobolev weights: λ_vel={self.lambda_vel}, λ_acc={self.lambda_acc}')
         print(f'{"="*70}\n')
         
         logs = defaultdict(def_value, OrderedDict())
@@ -367,7 +471,7 @@ class RVQTokenizerTrainerGAN:
                 
                 # ========== Generator Update ==========
                 results = self.forward(batch_data, global_step=it, optimizer_idx=0)
-                (loss, loss_rec, loss_vel, loss_commit, perplexity,
+                (loss, loss_rec, loss_vel, loss_acc, loss_commit, perplexity,
                  loss_kl, loss_gan_g, loss_perceptual, disc_weight) = results
                 
                 self.opt_vq_model.zero_grad()
@@ -399,6 +503,7 @@ class RVQTokenizerTrainerGAN:
                 logs['loss'] += loss.item()
                 logs['loss_rec'] += loss_rec.item()
                 logs['loss_vel'] += loss_vel.item()
+                logs['loss_acc'] += loss_acc.item()
                 logs['loss_commit'] += loss_commit.item()
                 logs['perplexity'] += perplexity.item()
                 logs['lr'] += self.opt_vq_model.param_groups[0]['lr']
@@ -428,7 +533,8 @@ class RVQTokenizerTrainerGAN:
                     log_str = (f"Ep: {epoch:03d} | It: {it:06d} | "
                               f"Loss: {mean_loss['loss']:.4f} | "
                               f"Rec: {mean_loss['loss_rec']:.4f} | "
-                              f"Vel: {mean_loss['loss_vel']:.4f}")
+                              f"Vel: {mean_loss['loss_vel']:.4f} | "
+                              f"Acc: {mean_loss['loss_acc']:.4f}")
                     
                     if self.is_vqkl:
                         log_str += f" | KL: {mean_loss['loss_kl']:.6f}"
@@ -461,12 +567,13 @@ class RVQTokenizerTrainerGAN:
                 with torch.no_grad():
                     for batch_data in val_loader:
                         results = self.forward(batch_data, global_step=it, optimizer_idx=0)
-                        (loss, loss_rec, loss_vel, loss_commit, perplexity,
+                        (loss, loss_rec, loss_vel, loss_acc, loss_commit, perplexity,
                          loss_kl, loss_gan_g, loss_perceptual, _) = results
                         
                         val_metrics['loss'].append(loss.item())
                         val_metrics['loss_rec'].append(loss_rec.item())
                         val_metrics['loss_vel'].append(loss_vel.item())
+                        val_metrics['loss_acc'].append(loss_acc.item())
                         val_metrics['loss_commit'].append(loss_commit.item())
                         val_metrics['perplexity'].append(perplexity.item())
                         
@@ -482,9 +589,10 @@ class RVQTokenizerTrainerGAN:
                 
                 avg_loss = np.mean(val_metrics['loss'])
                 
-                val_log = f'Val Loss: {avg_loss:.5f}'
-                for key in ['loss_rec', 'loss_vel', 'loss_commit']:
-                    val_log += f' | {key.split("_")[-1].capitalize()}: {np.mean(val_metrics[key]):.5f}'
+                val_log = (f'Val Loss: {avg_loss:.5f} | '
+                          f'Rec: {np.mean(val_metrics["loss_rec"]):.5f} | '
+                          f'Vel: {np.mean(val_metrics["loss_vel"]):.5f} | '
+                          f'Acc: {np.mean(val_metrics["loss_acc"]):.5f}')
                 
                 if self.is_vqkl:
                     val_log += f' | KL: {np.mean(val_metrics["loss_kl"]):.6f}'

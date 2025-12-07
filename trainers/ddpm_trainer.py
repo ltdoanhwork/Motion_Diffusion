@@ -229,3 +229,4 @@ class DDPMTrainer(object):
             if epoch % self.opt.save_every_e == 0:
                 self.save(pjoin(self.opt.model_dir, 'ckpt_e%03d.tar'%(epoch)),
                             epoch, total_it=it)
+

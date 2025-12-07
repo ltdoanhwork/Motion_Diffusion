@@ -1,6 +1,7 @@
 """
 Training script for VQ-KL Latent Diffusion
 Uses hybrid VQ-KL autoencoder with diffusion in latent space
+Updated with Sobolev Norm (High-order derivative loss)
 """
 
 import os
@@ -14,6 +15,7 @@ if PYMO_DIR not in sys.path:
     sys.path.insert(0, PYMO_DIR)
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 import joblib
 import random
@@ -74,6 +76,35 @@ def create_split_files(motion_dir, train_file, val_file, val_ratio=0.1):
     print(f"[INFO] Created {val_file} ({len(val_files)} samples)")
 
 
+def sobolev_loss(pred, target, depth=2):
+    """
+    Calculate Sobolev Loss (loss on high-order derivatives)
+    Args:
+        pred: (B, T, C) Predicted latent/motion
+        target: (B, T, C) Target latent/motion
+        depth: Number of derivatives to calculate (1=velocity, 2=acceleration)
+    """
+    loss = 0.0
+    # Note: 0-th order (Position) is usually covered by the main reconstruction loss (L1/MSE/KL)
+    # We focus on derivatives here.
+    
+    curr_pred = pred
+    curr_target = target
+    
+    for d in range(depth):
+        if curr_pred.shape[1] < 2:
+            break
+            
+        # Calculate finite difference (derivative proxy) along time dimension (dim=1)
+        curr_pred = curr_pred[:, 1:] - curr_pred[:, :-1]
+        curr_target = curr_target[:, 1:] - curr_target[:, :-1]
+        
+        # Add MSE of the derivative
+        loss += F.mse_loss(curr_pred, curr_target)
+        
+    return loss
+
+
 class VQKLDiffusionTrainer:
     """Trainer for VQ-KL Latent Diffusion with CFG support"""
     
@@ -118,6 +149,8 @@ class VQKLDiffusionTrainer:
         print(f"  - KL posterior mode: {model.use_kl_posterior}")
         print(f"  - Classifier-Free Guidance: p_uncond={args.cond_drop_prob}")
         print(f"  - Hand loss weight: {args.hand_loss_weight}")
+        if args.sobolev_loss_weight > 0:
+            print(f"  - Sobolev Loss Enabled: weight={args.sobolev_loss_weight}, depth={args.sobolev_depth}")
     
     def train_step(self, batch):
         """Single training step with CFG and optional hand boosting"""
@@ -177,8 +210,7 @@ class VQKLDiffusionTrainer:
             model_kwargs=model_kwargs
         )
         
-        # Total loss
-        # loss_total = compute_losses['loss'].mean()
+        # Base Diffusion Loss
         if 'loss' in compute_losses:
             loss_total = compute_losses['loss'].mean()
         elif 'l1' in compute_losses:
@@ -186,9 +218,31 @@ class VQKLDiffusionTrainer:
         elif 'mse' in compute_losses:
             loss_total = compute_losses['mse'].mean()
         else:
-            # Lấy đại giá trị đầu tiên nếu không tìm thấy key quen thuộc
+            # Fallback
             loss_total = list(compute_losses.values())[0].mean()
         
+        # --- Add Sobolev Loss (Temporal Smoothness) ---
+        sob_loss_val = 0.0
+        if self.args.sobolev_loss_weight > 0:
+            # We need the predicted x_start (clean latent) to calculate smoothness
+            # Most diffusion implementations return 'pred_xstart' in the losses dict
+            pred_xstart = compute_losses.get('pred_xstart')
+            
+            if pred_xstart is not None:
+                # Calculate Sobolev loss between Predicted Latent and Ground Truth Latent
+                sob_loss = sobolev_loss(pred_xstart, latent, depth=self.args.sobolev_depth)
+                loss_total = loss_total + self.args.sobolev_loss_weight * sob_loss
+                sob_loss_val = sob_loss.item()
+            else:
+                # If prediction is not available (e.g., simpler diffusion impl), try model_output
+                # Only if model predicts X_START (not EPSILON)
+                if self.diffusion.model_mean_type == ModelMeanType.START_X:
+                    model_output = compute_losses.get('model_output')
+                    if model_output is not None:
+                        sob_loss = sobolev_loss(model_output, latent, depth=self.args.sobolev_depth)
+                        loss_total = loss_total + self.args.sobolev_loss_weight * sob_loss
+                        sob_loss_val = sob_loss.item()
+
         # Add KL loss if available
         if encode_info.get('kl_loss') is not None:
             kl_loss = encode_info['kl_loss'].mean()
@@ -213,6 +267,7 @@ class VQKLDiffusionTrainer:
         result = {
             'loss': loss_total.item(),
             'kl_loss': kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss,
+            'sobolev_loss': sob_loss_val,
             'lr': self.optimizer.param_groups[0]['lr']
         }
         
@@ -347,6 +402,7 @@ class VQKLDiffusionTrainer:
             print(f"Val batches: {len(self.val_loader)}")
         print(f"CFG dropout prob: {self.args.cond_drop_prob}")
         print(f"KL weight: {self.args.kl_weight}")
+        print(f"Sobolev weight: {self.args.sobolev_loss_weight}")
         print("="*70)
         
         best_val_loss = float('inf')
@@ -355,6 +411,7 @@ class VQKLDiffusionTrainer:
             self.epoch = epoch
             epoch_losses = []
             epoch_kl_losses = []
+            epoch_sob_losses = []
             
             # Training
             for batch_idx, batch in enumerate(self.data_loader):
@@ -362,6 +419,9 @@ class VQKLDiffusionTrainer:
                 epoch_losses.append(losses['loss'])
                 if losses['kl_loss'] > 0:
                     epoch_kl_losses.append(losses['kl_loss'])
+                if losses['sobolev_loss'] > 0:
+                    epoch_sob_losses.append(losses['sobolev_loss'])
+                
                 self.global_step += 1
                 
                 # Logging
@@ -372,6 +432,9 @@ class VQKLDiffusionTrainer:
                     if epoch_kl_losses:
                         avg_kl = np.mean(epoch_kl_losses[-self.args.log_every:])
                         log_str += f" | KL: {avg_kl:.6f}"
+                    if epoch_sob_losses:
+                        avg_sob = np.mean(epoch_sob_losses[-self.args.log_every:])
+                        log_str += f" | Sob: {avg_sob:.6f}"
                     if 'loss_hand' in losses:
                         log_str += f" | Hand: {losses['loss_hand']:.4f}"
                     log_str += f" | LR: {losses['lr']:.8f}"
@@ -382,9 +445,10 @@ class VQKLDiffusionTrainer:
                     self.logger.add_scalar('train/lr', losses['lr'], self.global_step)
                     if epoch_kl_losses:
                         self.logger.add_scalar('train/kl_loss', avg_kl, self.global_step)
+                    if epoch_sob_losses:
+                        self.logger.add_scalar('train/sobolev_loss', avg_sob, self.global_step)
                     if 'loss_hand' in losses:
                         self.logger.add_scalar('train/loss_hand', losses['loss_hand'], self.global_step)
-                        self.logger.add_scalar('train/loss_latent', losses['loss_latent'], self.global_step)
                 
                 # Save periodic checkpoint
                 if self.global_step % self.args.save_every == 0:
@@ -492,6 +556,12 @@ def main():
                         help='Weight for KL divergence loss')
     parser.add_argument('--hand_boost_factor', type=float, default=1.0,
                         help='Signal boost factor for hand joints during encoding')
+    
+    # Sobolev Loss Args
+    parser.add_argument('--sobolev_loss_weight', type=float, default=0.0,
+                        help='Weight for Sobolev (derivative) loss. 0.0 to disable.')
+    parser.add_argument('--sobolev_depth', type=int, default=2,
+                        help='Depth of Sobolev loss (1 for velocity, 2 for acceleration)')
     
     # Sampler
     parser.add_argument('--sampler', type=str, default='ddim', choices=['ddpm', 'ddim'])
