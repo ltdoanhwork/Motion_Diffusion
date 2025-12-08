@@ -159,7 +159,7 @@ class VQKLLatentDiffusion(nn.Module):
         
         return latent_normalized, info
     
-    @torch.no_grad()
+    # @torch.no_grad()
     def decode_from_latent(self, latent):
         """
         Decode normalized latent back to motion space

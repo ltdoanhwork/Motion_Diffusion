@@ -29,11 +29,11 @@ out_dir = "/home/serverai/ltdoanh/Motion_Diffusion/datasets/BEAT_numpy"
 
 # os.system(command3)
 
-print("Đang chạy scale_factor.py...")
-command4 = f'python ./tools/scale_factor.py \
-            --vqvae_name VQKL_Enhanced_BEAT'
+# print("Đang chạy scale_factor.py...")
+# command4 = f'python ./tools/scale_factor.py \
+#             --vqvae_name VQKL_Enhanced_BEAT'
 
-os.system(command4)
+# os.system(command4)
 
 scale_factor_path = "./checkpoints/beat/VQKL_Enhanced_BEAT/scale_factor.txt" 
 scale_val = None
@@ -62,25 +62,28 @@ print("Đang chạy train_vq_diffusion.py...")
 
 command5 = f'python tools/train_vq_diffusion.py \
             --dataset_name beat \
-            --name vqkl_diff_sobolev_phys \
+            --name vqkl_diff_finetune \
             --vqkl_name VQKL_Enhanced_BEAT \
             --batch_size 64 \
-            --max_epoch 100 \
-            --lr 5e-5 \
-            --weight_decay 0.0 \
-            --grad_clip 0.5 \
-            --loss_type l1 \
+            --max_epoch 200 \
+            --lr 1e-4 \
+            --weight_decay 0.01 \
+            --dropout 0.1 \
+            --grad_clip 1.0 \
+            --loss_type rescaled_mse \
             --scale_factor {scale_val} \
-            --noise_schedule linear \
+            --noise_schedule cosine \
+            --schedule_sampler uniform \
             --use_kl_posterior \
-            --hand_loss_weight 20.0 \
-            --hand_boost_factor 5.0 \
-            --sobolev_loss_weight 0.3 \
+            --fft_loss_weight 0.05 \
+            --hand_loss_weight 2.0 \
+            --hand_boost_factor 1.0 \
+            --sobolev_loss_weight 0.1 \
             --sobolev_depth 2 \
             --physical_loss_weight 1.0 \
-            --foot_contact_threshold 0.003 \
+            --foot_contact_threshold 0.005 \
             --use_bone_loss \
-            --lambda_bone 0.2'
+            --lambda_bone 0.5'
 
 print(f"Command thực thi: {command5}")
 os.system(command5)
