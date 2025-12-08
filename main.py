@@ -72,7 +72,7 @@ command5 = f'python tools/train_vq_diffusion.py \
             --grad_clip 1.0 \
             --loss_type rescaled_mse \
             --scale_factor {scale_val} \
-            --noise_schedule cosine \
+            --noise_schedule linear \
             --schedule_sampler uniform \
             --use_kl_posterior \
             --fft_loss_weight 0.05 \
