@@ -185,6 +185,8 @@ def main():
     # Spectral Loss
     parser.add_argument('--lambda_spectral', type=float, default=0.1,
                         help='Weight for spectral/frequency domain loss')
+    parser.add_argument('--lambda_koleo', type=float, default=0.1,
+                    help='Weight for KoLeo codebook diversity loss')
     
     # Geometric Consistency
     parser.add_argument('--use_bone_loss', action='store_true', default=True,

@@ -4,7 +4,9 @@ Enhanced Trainer for VQ-KL Autoencoder with:
 - Sobolev Regularization (Velocity + Acceleration)
 - Spectral Loss (Frequency Domain)
 - Geometric Consistency (Bone Length Preservation)
+- KoLeo Loss (Codebook Diversity)
 - Cosine Annealing LR Scheduler
+- Detailed Loss Plotting
 
 Compatible with train_vq_with_discriminator.py
 """
@@ -20,6 +22,7 @@ import time
 import numpy as np
 from collections import OrderedDict, defaultdict
 import os
+import matplotlib.pyplot as plt
 
 try:
     from trainers.motion_vqperceptual import VQLPIPSWithDiscriminator
@@ -31,6 +34,188 @@ except ImportError:
 def def_value():
     return 0.0
 
+def save_loss_plot(history, save_path):
+    """
+    Save comprehensive loss plot with multiple subplots
+    
+    Args:
+        history: Dictionary of loss lists
+        save_path: Path to save the plot
+    """
+    valid_keys = [k for k in history.keys() if len(history[k]) > 0]
+    if not valid_keys:
+        print("[WARNING] No valid loss history to plot")
+        return
+    
+    plt.figure(figsize=(20, 15))
+    plt.style.use('seaborn-v0_8-whitegrid')
+    
+    # ==================== Subplot 1: Total Loss & LR ====================
+    plt.subplot(3, 3, 1)
+    if 'loss' in history and len(history['loss']) > 0:
+        plt.plot(history['loss'], label='Total Loss', color='black', linewidth=1.5)
+    plt.title("Total Loss Progress", fontsize=12, fontweight='bold')
+    plt.xlabel("Log Steps")
+    plt.ylabel("Loss Value")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    if 'lr' in history and len(history['lr']) > 0:
+        ax2 = plt.gca().twinx()
+        ax2.plot(history['lr'], label='Learning Rate', color='red', 
+                linestyle='--', alpha=0.6, linewidth=1.0)
+        ax2.set_ylabel("Learning Rate", color='red')
+        ax2.tick_params(axis='y', labelcolor='red')
+    
+    # ==================== Subplot 2: Reconstruction Losses ====================
+    plt.subplot(3, 3, 2)
+    rec_keys = ['loss_rec', 'loss_vel', 'loss_acc']
+    for k in rec_keys:
+        if k in history and len(history[k]) > 0:
+            label = k.replace('loss_', '').replace('_', ' ').title()
+            plt.plot(history[k], label=label, linewidth=1.2)
+    plt.title("Reconstruction & Derivatives", fontsize=12, fontweight='bold')
+    plt.xlabel("Log Steps")
+    plt.ylabel("Loss Value")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # ==================== Subplot 3: Spectral & Bone Losses ====================
+    plt.subplot(3, 3, 3)
+    geom_keys = ['loss_spectral', 'loss_bone']
+    for k in geom_keys:
+        if k in history and len(history[k]) > 0:
+            label = k.replace('loss_', '').replace('_', ' ').title()
+            plt.plot(history[k], label=label, linewidth=1.2)
+    plt.title("Geometric & Spectral", fontsize=12, fontweight='bold')
+    plt.xlabel("Log Steps")
+    plt.ylabel("Loss Value")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # ==================== Subplot 4: VQ Losses ====================
+    plt.subplot(3, 3, 4)
+    vq_keys = ['loss_commit', 'loss_kl', 'loss_koleo']
+    colors = ['blue', 'green', 'orange']
+    for k, color in zip(vq_keys, colors):
+        if k in history and len(history[k]) > 0:
+            label = k.replace('loss_', '').replace('_', ' ').title()
+            plt.plot(history[k], label=label, color=color, linewidth=1.2)
+    plt.title("VQ-KL & KoLeo Losses", fontsize=12, fontweight='bold')
+    plt.xlabel("Log Steps")
+    plt.ylabel("Loss Value")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # ==================== Subplot 5: GAN Losses ====================
+    plt.subplot(3, 3, 5)
+    gan_keys = ['loss_gan_g', 'loss_disc', 'loss_perceptual']
+    colors = ['red', 'purple', 'brown']
+    for k, color in zip(gan_keys, colors):
+        if k in history and len(history[k]) > 0:
+            label = k.replace('loss_', '').replace('_', ' ').title()
+            plt.plot(history[k], label=label, color=color, linewidth=1.2)
+    plt.title("GAN Losses (G, D, Perceptual)", fontsize=12, fontweight='bold')
+    plt.xlabel("Log Steps")
+    plt.ylabel("Loss Value")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # ==================== Subplot 6: Perplexity ====================
+    plt.subplot(3, 3, 6)
+    if 'perplexity' in history and len(history['perplexity']) > 0:
+        plt.plot(history['perplexity'], label='Codebook Perplexity', 
+                color='teal', linewidth=1.5)
+        plt.axhline(y=np.mean(history['perplexity'][-100:]), 
+                   color='r', linestyle='--', label='Recent Mean', alpha=0.5)
+    plt.title("Codebook Utilization", fontsize=12, fontweight='bold')
+    plt.xlabel("Log Steps")
+    plt.ylabel("Perplexity")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # ==================== Subplot 7: Discriminator Weight ====================
+    plt.subplot(3, 3, 7)
+    if 'disc_weight' in history and len(history['disc_weight']) > 0:
+        plt.plot(history['disc_weight'], label='Disc Weight', 
+                color='magenta', linewidth=1.5)
+    plt.title("Discriminator Weight Schedule", fontsize=12, fontweight='bold')
+    plt.xlabel("Log Steps")
+    plt.ylabel("Weight")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # ==================== Subplot 8: Loss Components Comparison ====================
+    plt.subplot(3, 3, 8)
+    compare_keys = ['loss_rec', 'loss_commit', 'loss_gan_g', 'loss_koleo']
+    for k in compare_keys:
+        if k in history and len(history[k]) > 0:
+            label = k.replace('loss_', '').replace('_', ' ').title()
+            # Normalize for comparison
+            data = np.array(history[k])
+            if len(data) > 0 and np.max(data) > 0:
+                normalized = data / np.max(data)
+                plt.plot(normalized, label=label, alpha=0.7, linewidth=1.0)
+    plt.title("Normalized Loss Components", fontsize=12, fontweight='bold')
+    plt.xlabel("Log Steps")
+    plt.ylabel("Normalized Value [0-1]")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # ==================== Subplot 9: Statistics Summary ====================
+    plt.subplot(3, 3, 9)
+    plt.axis('off')
+    
+    # Compute statistics
+    stats_text = "Training Statistics\n" + "="*30 + "\n\n"
+    
+    key_metrics = {
+        'Total Loss': 'loss',
+        'Reconstruction': 'loss_rec',
+        'Velocity': 'loss_vel',
+        'Acceleration': 'loss_acc',
+        'Spectral': 'loss_spectral',
+        'Bone': 'loss_bone',
+        'Commit': 'loss_commit',
+        'KL': 'loss_kl',
+        'GAN-G': 'loss_gan_g',
+        'GAN-D': 'loss_disc',
+        'Perceptual': 'loss_perceptual',
+        'Perplexity': 'perplexity'
+    }
+    
+    for display_name, key in key_metrics.items():
+        if key in history and len(history[key]) > 0:
+            data = history[key]
+            recent = data[-100:] if len(data) > 100 else data
+            mean_val = np.mean(recent)
+            std_val = np.std(recent)
+            min_val = np.min(recent)
+            max_val = np.max(recent)
+            
+            stats_text += f"{display_name}:\n"
+            stats_text += f"  Mean: {mean_val:.6f}\n"
+            stats_text += f"  Std:  {std_val:.6f}\n"
+            stats_text += f"  Min:  {min_val:.6f}\n"
+            stats_text += f"  Max:  {max_val:.6f}\n\n"
+    
+    plt.text(0.1, 0.95, stats_text, transform=plt.gca().transAxes,
+            fontsize=8, verticalalignment='top', fontfamily='monospace',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
+    
+    plt.suptitle("VQ-KL Autoencoder Training - Comprehensive Loss Analysis", 
+                fontsize=16, fontweight='bold', y=0.995)
+    
+    plt.tight_layout(rect=[0, 0, 1, 0.99])
+    
+    try:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"[INFO] ✓ Loss plot saved to {save_path}")
+    except Exception as e:
+        print(f"[WARNING] Failed to save plot: {e}")
+        plt.close()
+
 
 class RVQTokenizerTrainerGAN:
     """
@@ -41,6 +226,7 @@ class RVQTokenizerTrainerGAN:
     - Geometric Consistency (Bone Length Preservation)
     - GAN + Perceptual Loss
     - Cosine Annealing LR Scheduling
+    - Comprehensive Loss Plotting
     """
     
     def __init__(self, args, vq_model, 
@@ -163,6 +349,16 @@ class RVQTokenizerTrainerGAN:
                 ).to(self.device)
                 
                 print(f"[INFO] ✓ VQLPIPSWithDiscriminator initialized")
+            
+            # Loss history for plotting
+            self.loss_history = {
+                'loss': [], 'lr': [],
+                'loss_rec': [], 'loss_vel': [], 'loss_acc': [],
+                'loss_spectral': [], 'loss_bone': [],
+                'loss_commit': [], 'loss_kl': [],
+                'loss_gan_g': [], 'loss_disc': [], 'loss_perceptual': [],
+                'perplexity': [], 'disc_weight': []
+            }
 
     def create_spatial_mask(self, motion_shape, device):
         """
@@ -234,7 +430,6 @@ class RVQTokenizerTrainerGAN:
             loss_spectral: Spectral loss value
         """
         # Apply FFT along time dimension (dim=1)
-        # rfft returns complex numbers for real input
         fft_pred = torch.fft.rfft(pred_motion, dim=1)
         fft_gt = torch.fft.rfft(gt_motion, dim=1)
         
@@ -267,9 +462,7 @@ class RVQTokenizerTrainerGAN:
         B, T, D = pred_motion.shape
         
         # Assume D contains XYZ coordinates: reshape to (B, T, J, 3)
-        # where J = D // 3 (number of joints)
         if D % 3 != 0:
-            # If not divisible by 3, skip bone loss
             return torch.tensor(0.0, device=pred_motion.device)
         
         J = D // 3
@@ -287,8 +480,8 @@ class RVQTokenizerTrainerGAN:
             gt_bone = gt_joints[:, :, end_idx, :] - gt_joints[:, :, start_idx, :]
             
             # Compute bone lengths
-            pred_length = torch.norm(pred_bone, dim=-1)  # (B, T)
-            gt_length = torch.norm(gt_bone, dim=-1)      # (B, T)
+            pred_length = torch.norm(pred_bone, dim=-1)
+            gt_length = torch.norm(gt_bone, dim=-1)
             
             # Penalize length difference
             bone_loss = F.mse_loss(pred_length, gt_length)
@@ -333,7 +526,7 @@ class RVQTokenizerTrainerGAN:
 
     def forward(self, batch_data, global_step=0, optimizer_idx=0):
         """
-        Forward pass with all regularizations
+        Forward pass with all regularizations including KoLeo
         """
         motions = batch_data[1].detach().to(self.device).float()
         
@@ -364,6 +557,7 @@ class RVQTokenizerTrainerGAN:
                 mean = posterior.mean if hasattr(posterior, 'mean') else posterior.mode()
                 logvar = posterior.logvar if hasattr(posterior, 'logvar') else torch.zeros_like(mean)
                 loss_kl = -0.5 * torch.sum(1 + logvar - mean.pow(2) - logvar.exp()) / mean.shape[0]
+
         else:
             # Standard VQ-VAE Mode
             pred_motion, loss_vq, perplexity = self.vq_model(motions)
@@ -426,12 +620,14 @@ class RVQTokenizerTrainerGAN:
                 # Discriminator update
                 return (gan_loss, torch.tensor(0.0), torch.tensor(0.0), 
                        torch.tensor(0.0), torch.tensor(0.0), torch.tensor(0.0),
-                       torch.tensor(0.0), perplexity, torch.tensor(0.0),
-                       torch.tensor(0.0), torch.tensor(0.0), torch.tensor(0.0))
+                       torch.tensor(0.0), perplexity, torch.tensor(0.0), 
+                       torch.tensor(0.0), torch.tensor(0.0), torch.tensor(0.0), 
+                       torch.tensor(0.0))
         
         else:
             # No GAN
-            loss = (loss_total_rec + self.opt.commit * loss_commit)
+            loss = (loss_total_rec + 
+                   self.opt.commit * loss_commit)
             
             if self.is_vqkl:
                 loss = loss + self.kl_weight * loss_kl
@@ -472,7 +668,7 @@ class RVQTokenizerTrainerGAN:
         return checkpoint['ep'], checkpoint['total_it']
 
     def train(self, train_loader, val_loader=None):
-        """Main training loop"""
+        """Main training loop with comprehensive logging"""
         self.vq_model.to(self.device)
 
         # Generator optimizer
@@ -487,7 +683,7 @@ class RVQTokenizerTrainerGAN:
         self.scheduler_g = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.opt_vq_model,
             T_max=self.opt.max_epoch,
-            eta_min=self.opt.lr * 0.01  # Minimum LR = 1% of initial
+            eta_min=self.opt.lr * 0.01
         )
         
         # Discriminator optimizer
@@ -596,6 +792,11 @@ class RVQTokenizerTrainerGAN:
                         )
                         mean_loss[tag] = value / self.opt.log_every
                     
+                    # Update loss history for plotting
+                    for key in self.loss_history.keys():
+                        if key in mean_loss:
+                            self.loss_history[key].append(mean_loss[key])
+                    
                     logs = defaultdict(def_value, OrderedDict())
                     
                     # Console output
@@ -603,9 +804,7 @@ class RVQTokenizerTrainerGAN:
                               f"Loss: {mean_loss['loss']:.4f} | "
                               f"Rec: {mean_loss['loss_rec']:.4f} | "
                               f"Vel: {mean_loss['loss_vel']:.4f} | "
-                              f"Acc: {mean_loss['loss_acc']:.4f} | "
-                              f"Spec: {mean_loss['loss_spectral']:.4f} | "
-                              f"Bone: {mean_loss['loss_bone']:.4f}")
+                              f"Acc: {mean_loss['loss_acc']:.4f} | ")
                     
                     if self.is_vqkl:
                         log_str += f" | KL: {mean_loss['loss_kl']:.6f}"
@@ -615,6 +814,11 @@ class RVQTokenizerTrainerGAN:
                                    f"D: {mean_loss.get('loss_disc', 0.0):.4f}")
                     
                     print(log_str)
+                    
+                    # Save loss plot periodically
+                    if it % (self.opt.log_every * 10) == 0:
+                        plot_path = pjoin(self.opt.log_dir, f'loss_step_{it:06d}.png')
+                        save_loss_plot(self.loss_history, plot_path)
 
                 if it % self.opt.save_latest == 0:
                     self.save(pjoin(self.opt.model_dir, 'latest.tar'), epoch, it)
@@ -644,7 +848,7 @@ class RVQTokenizerTrainerGAN:
                     for batch_data in val_loader:
                         results = self.forward(batch_data, global_step=it, optimizer_idx=0)
                         (loss, loss_rec, loss_vel, loss_acc, loss_spectral, loss_bone,
-                         loss_commit, perplexity, loss_kl, _, _, _) = results
+                         loss_commit, perplexity, loss_kl, loss_koleo, _, _, _) = results
                         
                         val_metrics['loss'].append(loss.item())
                         val_metrics['loss_rec'].append(loss_rec.item())
@@ -668,9 +872,8 @@ class RVQTokenizerTrainerGAN:
                 val_log = (f'Val Loss: {avg_loss:.5f} | '
                           f'Rec: {np.mean(val_metrics["loss_rec"]):.5f} | '
                           f'Vel: {np.mean(val_metrics["loss_vel"]):.5f} | '
-                          f'Acc: {np.mean(val_metrics["loss_acc"]):.5f} | '
-                          f'Spec: {np.mean(val_metrics["loss_spectral"]):.5f} | '
-                          f'Bone: {np.mean(val_metrics["loss_bone"]):.5f}')
+                          f'KoLeo: {np.mean(val_metrics["loss_koleo"]):.5f} | '
+                          f'Perp: {np.mean(val_metrics["perplexity"]):.2f}')
                 
                 if self.is_vqkl:
                     val_log += f' | KL: {np.mean(val_metrics["loss_kl"]):.6f}'
@@ -679,22 +882,30 @@ class RVQTokenizerTrainerGAN:
 
                 # Save best model
                 if avg_loss < min_val_loss:
-                    print(f'\n🎉 NEW BEST: {min_val_loss:.5f} → {avg_loss:.5f}\n')
+                    print(f'\n NEW BEST: {min_val_loss:.5f} → {avg_loss:.5f}\n')
                     min_val_loss = avg_loss
                     self.save(pjoin(self.opt.model_dir, 'best_model.tar'), epoch, it)
                 
                 print(f'{"="*80}\n')
+                
+                # Save validation plot
+                val_plot_path = pjoin(self.opt.log_dir, f'loss_epoch_{epoch:04d}.png')
+                save_loss_plot(self.loss_history, val_plot_path)
 
         # ==================== Training Complete ====================
         elapsed = time.time() - start_time
         print(f'\n{"="*80}')
-        print(f'✅ Training Complete!')
+        print(f' Training Complete!')
         print(f'{"="*80}')
         print(f'Total Time: {elapsed/3600:.2f} hours')
         print(f'Final Epoch: {epoch}')
         print(f'Total Iterations: {it}')
         print(f'Best Val Loss: {min_val_loss:.5f}')
         print(f'{"="*80}\n')
+        
+        # Save final loss plot
+        final_plot_path = pjoin(self.opt.log_dir, 'final_loss_curve.png')
+        save_loss_plot(self.loss_history, final_plot_path)
 
 
 # ==================== Utility Functions ====================
@@ -706,41 +917,21 @@ def get_smpl_bone_pairs():
     Returns:
         List of tuples [(parent_joint_idx, child_joint_idx), ...]
     """
-    # SMPL 24 joint skeleton topology
-    # Joint indices based on standard SMPL model
     bone_pairs = [
         # Spine
-        (0, 1),   # Pelvis -> L_Hip
-        (0, 2),   # Pelvis -> R_Hip
-        (0, 3),   # Pelvis -> Spine1
-        (3, 6),   # Spine1 -> Spine2
-        (6, 9),   # Spine2 -> Spine3
-        (9, 12),  # Spine3 -> Neck
-        (12, 15), # Neck -> Head
+        (0, 1), (0, 2), (0, 3), (3, 6), (6, 9), (9, 12), (12, 15),
         
         # Left Leg
-        (1, 4),   # L_Hip -> L_Knee
-        (4, 7),   # L_Knee -> L_Ankle
-        (7, 10),  # L_Ankle -> L_Foot
+        (1, 4), (4, 7), (7, 10),
         
         # Right Leg
-        (2, 5),   # R_Hip -> R_Knee
-        (5, 8),   # R_Knee -> R_Ankle
-        (8, 11),  # R_Ankle -> R_Foot
+        (2, 5), (5, 8), (8, 11),
         
         # Left Arm
-        (9, 13),  # Spine3 -> L_Collar
-        (13, 16), # L_Collar -> L_Shoulder
-        (16, 18), # L_Shoulder -> L_Elbow
-        (18, 20), # L_Elbow -> L_Wrist
-        (20, 22), # L_Wrist -> L_Hand
+        (9, 13), (13, 16), (16, 18), (18, 20), (20, 22),
         
         # Right Arm
-        (9, 14),  # Spine3 -> R_Collar
-        (14, 17), # R_Collar -> R_Shoulder
-        (17, 19), # R_Shoulder -> R_Elbow
-        (19, 21), # R_Elbow -> R_Wrist
-        (21, 23), # R_Wrist -> R_Hand
+        (9, 14), (14, 17), (17, 19), (19, 21), (21, 23),
     ]
     
     return bone_pairs
@@ -757,10 +948,8 @@ def get_hand_joint_indices(skeleton_type='smpl'):
         torch.Tensor: Indices of hand joints (for xyz coordinates, multiply by 3)
     """
     if skeleton_type == 'smpl':
-        # SMPL hand joints (wrists + hands)
         hand_joints = [20, 21, 22, 23]  # L_Wrist, R_Wrist, L_Hand, R_Hand
     elif skeleton_type == 'cmu':
-        # CMU MoCap format (approximate)
         hand_joints = [9, 10, 11, 12, 24, 25, 26, 27]
     else:
         raise ValueError(f"Unknown skeleton type: {skeleton_type}")

@@ -316,7 +316,7 @@ class MotionTransformer(nn.Module):
         self.sequence_embedding = nn.Parameter(torch.randn(num_frames, latent_dim))
 
         # Text Transformer
-        self.clip, _ = clip.load('ViT-B/32', "cpu")
+        self.clip, _ = clip.load('/iridisfs/scratch/tvtn1c23/motion/ViT-B-32.pt', "cpu")
         if no_clip:
             self.clip.initialize_parameters()
         else:
