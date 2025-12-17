@@ -1,5 +1,5 @@
 """
-Script to calculate the scale factor for VQ-VAE latent space
+Script to calculate the scale factor for VQ-KL latent space
 This ensures the latent distribution matches Gaussian diffusion assumptions
 """
 import os
@@ -22,12 +22,14 @@ from tqdm import tqdm
 from models.vq.model import RVQVAE
 from datasets.dataset import Beat2MotionDataset
 
-
 def calculate_scale_factor(args):
     """Calculate scale factor from training data latents"""
     
-    # Load VQ-VAE model
-    print("Loading VQ-VAE model...")
+    # Load VQ-KL model
+    print("Loading VQ-KL model...")
+    
+    # Cấu hình phải khớp với lúc train (thêm double_z và embed_dim)
+    # FIX: Updated nb_code to 1024 to match checkpoint
     vqvae_config = {
         'args': type('Args', (), {
             'num_quantizers': 10,
@@ -36,7 +38,7 @@ def calculate_scale_factor(args):
             'mu': 0.99,
         })(),
         'input_width': 264,
-        'nb_code': 512,
+        'nb_code': 1024,   # <--- FIX: Changed from 512 to 1024
         'code_dim': 512,
         'output_emb_width': 512,
         'down_t': 3,
@@ -45,7 +47,9 @@ def calculate_scale_factor(args):
         'depth': 3,
         'dilation_growth_rate': 3,
         'activation': 'relu',
-        'norm': None
+        'norm': None,
+        'embed_dim': 512,  # Quan trọng cho VQ-KL
+        'double_z': True   # Quan trọng cho VQ-KL
     }
     
     vqvae = RVQVAE(**vqvae_config)
@@ -53,6 +57,12 @@ def calculate_scale_factor(args):
     # Load checkpoint
     checkpoint_path = pjoin(args.checkpoints_dir, 'beat', args.vqvae_name, 'model', 'best_model.tar')
     print(f"Loading checkpoint from {checkpoint_path}")
+    
+    if not os.path.exists(checkpoint_path):
+        # Fallback to latest if best not found
+        checkpoint_path = pjoin(args.checkpoints_dir, 'beat', args.vqvae_name, 'model', 'latest.tar')
+        print(f"Best model not found, trying: {checkpoint_path}")
+
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     if 'vq_model' in checkpoint:
         vqvae.load_state_dict(checkpoint['vq_model'])
@@ -101,12 +111,15 @@ def calculate_scale_factor(args):
             _, motion, _ = batch
             motion = motion.to(args.device).float()
             
-            # Encode to latent
-            code_idx, all_codes = vqvae.encode(motion)
-            # Sum over quantizers
-            latent = all_codes.sum(dim=0)  # (B, T_latent, code_dim)
+            # --- KHÁC BIỆT CHÍNH CHO VQ-KL ---
+            # Encode trả về Posterior Distribution (DiagonalGaussianDistribution)
+            posterior = vqvae.encode(motion)
             
-            # Transpose to (B, T, D)
+            # Lấy sample() để tính scale factor dựa trên phân phối thực tế mà Diffusion model sẽ học
+            # (Hoặc có thể dùng .mode() nếu muốn chuẩn hóa dựa trên mean)
+            latent = posterior.sample() # Shape: (B, C, T)
+            
+            # Transpose to (B, T, D) for statistics calculation
             latent = latent.permute(0, 2, 1)
             
             all_latents.append(latent.cpu().numpy())
@@ -126,7 +139,7 @@ def calculate_scale_factor(args):
     latent_max = all_latents.max()
     
     print("\n" + "="*60)
-    print("LATENT SPACE STATISTICS")
+    print("VQ-KL LATENT SPACE STATISTICS")
     print("="*60)
     print(f"Mean:  {latent_mean:.6f}")
     print(f"Std:   {latent_std:.6f}")
@@ -135,35 +148,33 @@ def calculate_scale_factor(args):
     print(f"Range: [{latent_min:.6f}, {latent_max:.6f}]")
     print("="*60)
     
-    # Calculate scale factor
+    # Calculate scale factor (Standard LDM formula: 1 / std)
     scale_factor = 1.0 / latent_std
     print(f"\nRecommended SCALE_FACTOR: {scale_factor:.8f}")
     print("="*60)
     
     # Test reconstruction quality
-    print("\nTesting VQ-VAE reconstruction quality...")
-    test_batch_idx = 0
+    print("\nTesting VQ-KL reconstruction quality...")
     with torch.no_grad():
         for batch in dataloader:
             _, motion, _ = batch
             motion = motion[:4].to(args.device).float()  # Take 4 samples
             
             # Encode
-            code_idx, all_codes = vqvae.encode(motion)
-            latent = all_codes.sum(dim=0).permute(0, 2, 1)
+            posterior = vqvae.encode(motion)
+            z = posterior.mode() # Use mode for cleaner reconstruction check
             
-            # Decode
-            latent_transposed = latent.permute(0, 2, 1)
-            recon_motion = vqvae.decoder(latent_transposed)
+            # Decode (Model handles permutation/postprocess internally now)
+            recon_motion = vqvae.decode(z)
             
             # Calculate MSE
             mse = torch.nn.functional.mse_loss(motion, recon_motion)
-            print(f"VQ-VAE Reconstruction MSE: {mse.item():.6f}")
+            print(f"VQ-KL Reconstruction MSE: {mse.item():.6f}")
             
             if mse.item() > 1.0:
-                print("⚠️  WARNING: High reconstruction error! Check VQ-VAE checkpoint.")
+                print("⚠️  WARNING: High reconstruction error! Check VQ-KL checkpoint.")
             else:
-                print("✓ VQ-VAE reconstruction looks good.")
+                print("✓ VQ-KL reconstruction looks good.")
             break
     
     # Save scale factor
@@ -175,9 +186,8 @@ def calculate_scale_factor(args):
     
     print(f"\n✓ Scale factor saved to: {save_path}")
     print("\nNext steps:")
-    print("1. Add this scale_factor to your VQLatentDiffusion model")
-    print("2. Multiply latent by scale_factor in encode_to_latent()")
-    print("3. Divide latent by scale_factor in decode_from_latent()")
+    print("1. Add this scale_factor to your VQKLLatentDiffusion model")
+    print("2. The Diffusion model will now see latents with std ~ 1.0")
 
 
 if __name__ == "__main__":
@@ -186,9 +196,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_root', type=str, default='./datasets/BEAT_numpy')
     parser.add_argument('--checkpoints_dir', type=str, default='./checkpoints')
-    parser.add_argument('--vqvae_name', type=str, default='VQVAE_BEAT')
+    parser.add_argument('--vqvae_name', type=str, default='VQKL_BEAT') # Default updated to VQKL
     parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--max_samples', type=int, default=5000, 
+    parser.add_argument('--max_samples', type=int, default=10000, 
                         help='Max samples to process (0 = all)')
     parser.add_argument('--gpu_id', type=int, default=0)
     

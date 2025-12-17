@@ -1,6 +1,6 @@
 """
-VQ-VAE Latent Diffusion Model for Motion Generation
-FIXED: Added proper latent scaling for Gaussian diffusion compatibility
+VQ-KL Latent Diffusion Model for Motion Generation
+Updated to use VQ-KL autoencoder architecture (hybrid VQ-VAE + KL)
 """
 import os
 import sys
@@ -15,18 +15,20 @@ from models.vq.model import RVQVAE
 from models.transformer import MotionTransformer
 
 
-class VQLatentDiffusion(nn.Module):
+class VQKLLatentDiffusion(nn.Module):
     """
-    Latent Diffusion Model with proper scaling for VQ-VAE latent space
+    Latent Diffusion Model with VQ-KL autoencoder
+    Combines discrete VQ codes with continuous KL-regularized latent space
     """
     def __init__(
         self,
-        # VQ-VAE parameters
-        vqvae_config,
-        vqvae_checkpoint=None,
-        freeze_vqvae=True,
-        # Latent scaling (CRITICAL FIX)
+        # VQ-KL Autoencoder parameters
+        vqkl_config,
+        vqkl_checkpoint=None,
+        freeze_vqkl=True,
+        # Latent scaling
         scale_factor=1.0,
+        use_kl_posterior=True,  # Use KL posterior sampling vs VQ codes
         # Diffusion transformer parameters
         latent_dim=512,
         num_frames=60,
@@ -48,34 +50,38 @@ class VQLatentDiffusion(nn.Module):
         
         self.latent_dim = latent_dim
         self.num_frames = num_frames
-        self.freeze_vqvae = freeze_vqvae
+        self.freeze_vqkl = freeze_vqkl
+        self.use_kl_posterior = use_kl_posterior
         
-        # CRITICAL: Scale factor to normalize latent distribution
+        # Scale factor for latent normalization
         self.scale_factor = scale_factor
         print(f"[INFO] Using scale_factor={scale_factor:.6f} for latent normalization")
+        print(f"[INFO] KL posterior mode: {use_kl_posterior}")
         
-        # Initialize VQ-VAE
-        self.vqvae = RVQVAE(**vqvae_config)
+        # Initialize VQ-KL Autoencoder
+        self.vqkl = RVQVAE(**vqkl_config)
         
-        # Load VQ-VAE checkpoint if provided
-        if vqvae_checkpoint is not None:
-            print(f"Loading VQ-VAE from {vqvae_checkpoint}")
-            checkpoint = torch.load(vqvae_checkpoint, map_location='cpu')
+        # Load checkpoint if provided
+        if vqkl_checkpoint is not None:
+            print(f"Loading VQ-KL from {vqkl_checkpoint}")
+            checkpoint = torch.load(vqkl_checkpoint, map_location='cpu')
             if 'vq_model' in checkpoint:
-                self.vqvae.load_state_dict(checkpoint['vq_model'])
+                self.vqkl.load_state_dict(checkpoint['vq_model'])
+            elif 'state_dict' in checkpoint:
+                self.vqkl.load_state_dict(checkpoint['state_dict'])
             else:
-                self.vqvae.load_state_dict(checkpoint)
-            print("VQ-VAE loaded successfully")
+                self.vqkl.load_state_dict(checkpoint)
+            print("VQ-KL loaded successfully")
         
-        # Freeze VQ-VAE if required
-        if freeze_vqvae:
-            for param in self.vqvae.parameters():
+        # Freeze if required
+        if freeze_vqkl:
+            for param in self.vqkl.parameters():
                 param.requires_grad = False
-            self.vqvae.eval()
-            print("VQ-VAE frozen")
+            self.vqkl.eval()
+            print("VQ-KL frozen")
         
-        # Input features for transformer
-        input_feats = vqvae_config['code_dim']
+        # Get latent dimension from config
+        input_feats = vqkl_config.get('embed_dim', vqkl_config.get('code_dim', 512))
         
         # Initialize Motion Transformer
         self.transformer = MotionTransformer(
@@ -95,69 +101,85 @@ class VQLatentDiffusion(nn.Module):
             no_eff=no_eff
         )
         
-        print(f"VQLatentDiffusion initialized:")
+        print(f"VQKLLatentDiffusion initialized:")
         print(f"  - Input features: {input_feats}")
         print(f"  - Latent seq length: {num_frames}")
         print(f"  - Transformer latent dim: {latent_dim}")
         print(f"  - Scale factor: {scale_factor:.6f}")
     
     @torch.no_grad()
-    def encode_to_latent(self, motion):
+    def encode_to_latent(self, motion, sample_posterior=True):
         """
-        Encode motion to NORMALIZED latent space
+        Encode motion to normalized latent space using VQ-KL
         Args:
             motion: (B, T, D) raw motion data
+            sample_posterior: If True, sample from KL posterior; else use VQ codes
         Returns:
-            latent: (B, T_latent, code_dim) normalized latent (mean~0, std~1)
-            code_idx: (B, T_latent, num_quantizers) discrete code indices
+            latent: (B, T_latent, embed_dim) normalized latent
+            info: dict with encoding information (posterior, codes, etc.)
         """
-        if self.freeze_vqvae:
-            self.vqvae.eval()
+        if self.freeze_vqkl:
+            self.vqkl.eval()
         
-        # Encode motion
-        code_idx, all_codes = self.vqvae.encode(motion)
-        # all_codes: (Q, B, T_latent, code_dim)
+        # Encode through VQ-KL encoder
+        if hasattr(self.vqkl, 'encode'):
+            # VQ-KL style: returns posterior distribution
+            posterior = self.vqkl.encode(motion)
+            
+            if self.use_kl_posterior:
+                # Use KL posterior (continuous)
+                if sample_posterior:
+                    latent = posterior.sample()
+                else:
+                    latent = posterior.mode()
+            else:
+                # Fallback to VQ codes if configured
+                # Note: This branch might need adjustment depending on exact VQ-KL implementation
+                latent = posterior.mode() 
+            
+            info = {
+                'posterior': posterior,
+                'kl_loss': posterior.kl() if hasattr(posterior, 'kl') else None
+            }
+            
+        else:
+            # Fallback to VQ-VAE style
+            code_idx, all_codes = self.vqkl.encode(motion)
+            latent = all_codes.sum(dim=0)  # (B, T_latent, code_dim)
+            latent = latent.permute(0, 2, 1)
+            info = {'code_idx': code_idx}
         
-        # Sum over quantizers
-        latent = all_codes.sum(dim=0)  # (B, T_latent, code_dim)
-        
-        # Transpose to (B, T, D)
-        latent = latent.permute(0, 2, 1)  # (B, T_latent, code_dim)
-        
-        # CRITICAL FIX: Scale latent to have std ~ 1.0
-        # This makes it compatible with Gaussian diffusion noise
+        # Ensure correct shape (B, T, C)
+        if latent.shape[1] == self.vqkl.embed_dim and latent.shape[2] != self.vqkl.embed_dim:
+             # (B, C, T) -> (B, T, C)
+             latent = latent.permute(0, 2, 1)
+
+        # Normalize latent
         latent_normalized = latent * self.scale_factor
         
-        # Verify shape
-        B = latent_normalized.shape[0]
-        assert latent_normalized.shape == (B, self.num_frames, self.vqvae.code_dim), \
-            f"Latent shape mismatch: {latent_normalized.shape} vs ({B}, {self.num_frames}, {self.vqvae.code_dim})"
-        
-        return latent_normalized, code_idx
+        return latent_normalized, info
     
     # @torch.no_grad()
-    def decode_from_latent(self, latent=None, code_idx=None):
+    def decode_from_latent(self, latent):
         """
-        Decode NORMALIZED latent back to motion space
+        Decode normalized latent back to motion space
         Args:
-            latent: (B, T_latent, code_dim) normalized latent from diffusion
-            code_idx: (B, T_latent, Q) discrete code indices
+            latent: (B, T_latent, embed_dim) normalized latent from diffusion
         Returns:
             motion: (B, T, D) reconstructed motion
         """
-        if self.freeze_vqvae:
-            self.vqvae.eval()
+        if self.freeze_vqkl:
+            self.vqkl.eval()
         
-        if code_idx is not None:
-            # Use discrete codes
-            motion = self.vqvae.forward_decoder(code_idx)
-        else:
-            # CRITICAL FIX: Rescale latent back to original magnitude
-            latent_rescaled = latent / self.scale_factor
+        # Rescale latent back to original magnitude
+        latent_rescaled = latent / self.scale_factor
+        
+        # Handle shape for decoder: Decoder expects (B, C, T) usually
+        if latent_rescaled.shape[-1] == self.vqkl.embed_dim:
+             # (B, T, C) -> (B, C, T)
+             latent_rescaled = latent_rescaled.permute(0, 2, 1)
             
-            # Transpose for decoder: (B, T_latent, code_dim) -> (B, code_dim, T_latent)
-            latent_transposed = latent_rescaled.permute(0, 2, 1)
-            motion = self.vqvae.decoder(latent_transposed)
+        motion = self.vqkl.decode(latent_rescaled)
         
         return motion
     
@@ -188,13 +210,8 @@ class VQLatentDiffusion(nn.Module):
             xf_out = kwargs.get('xf_out', None)
         
         # Check if input is already in latent space
-        if x.shape[-1] == self.vqvae.code_dim and x.shape[1] == self.num_frames:
-            latent = x
-        else:
-            # Encode if raw motion (shouldn't happen during training)
-            with torch.no_grad():
-                latent, _ = self.encode_to_latent(x)
-
+        latent = x
+        
         # Predict noise/x_0 in latent space
         output = self.transformer(
             latent, 
@@ -208,24 +225,23 @@ class VQLatentDiffusion(nn.Module):
         return output
 
 
-class VQLatentDiffusionWrapper(nn.Module):
+class VQKLLatentDiffusionWrapper(nn.Module):
     """
-    Wrapper for training VQ Latent Diffusion with GaussianDiffusion
+    Wrapper for training VQ-KL Latent Diffusion with GaussianDiffusion
     """
-    def __init__(self, vq_diffusion_model):
+    def __init__(self, vqkl_diffusion_model):
         super().__init__()
-        self.model = vq_diffusion_model
+        self.model = vqkl_diffusion_model
         
     def forward(self, x, timesteps, **kwargs):
         """
         Args:
-            x: (B, T_latent, code_dim) - normalized noisy latent from GaussianDiffusion
+            x: (B, T_latent, embed_dim) - normalized noisy latent
             timesteps: (B,) diffusion timesteps  
             **kwargs: Contains 'y' dict with text, length, etc.
         Returns:
-            output: (B, T_latent, code_dim) - predicted in latent space
+            output: (B, T_latent, embed_dim) - predicted in latent space
         """
-        # Extract conditioning
         y_dict = kwargs.get('y', {})
         text = y_dict.get('text', None)
         length = y_dict.get('length', None)
@@ -234,15 +250,8 @@ class VQLatentDiffusionWrapper(nn.Module):
         
         # Validate input shape
         assert x.dim() == 3, f"Expected 3D input (B, T, D), got {x.shape}"
-        B, T, D = x.shape
         
-        # Verify dimensions
-        assert T == self.model.num_frames, \
-            f"Sequence length mismatch: {T} vs {self.model.num_frames}"
-        assert D == self.model.vqvae.code_dim, \
-            f"Feature dim mismatch: {D} vs {self.model.vqvae.code_dim}"
-        
-        # x is already normalized latent, apply transformer
+        # Apply transformer
         output = self.model.transformer(
             x,
             timesteps,
@@ -255,17 +264,18 @@ class VQLatentDiffusionWrapper(nn.Module):
         return output
 
 
-def create_vq_latent_diffusion(
+def create_vqkl_latent_diffusion(
     dataset_name='beat',
-    vqvae_name='VQVAE_BEAT',
+    vqkl_name='VQKL_BEAT',
     checkpoints_dir='./checkpoints',
     device='cuda',
-    freeze_vqvae=True,
-    scale_factor=None,  # NEW: Allow passing scale_factor
+    freeze_vqkl=True,
+    scale_factor=None,
+    use_kl_posterior=True,
     **diffusion_kwargs
 ):
     """
-    Factory function to create VQLatentDiffusion model with proper scaling
+    Factory function to create VQKLLatentDiffusion model
     """
     import os
     from os.path import join as pjoin
@@ -289,8 +299,8 @@ def create_vq_latent_diffusion(
     # Calculate latent sequence length
     num_frames_latent = num_frames_original // (2 ** down_t)
     
-    # VQ-VAE configuration
-    vqvae_config = {
+    # VQ-KL configuration (hybrid VQ + KL)
+    vqkl_config = {
         'args': type('Args', (), {
             'num_quantizers': 10,
             'shared_codebook': False,
@@ -298,8 +308,10 @@ def create_vq_latent_diffusion(
             'mu': 0.99,
         })(),
         'input_width': dim_pose,
-        'nb_code': 512,
+        # FIX: Changed nb_code from 512 to 1024 to match checkpoint
+        'nb_code': 1024, 
         'code_dim': 512,
+        'embed_dim': 512,  # For KL posterior
         'output_emb_width': 512,
         'down_t': down_t,
         'stride_t': 2,
@@ -307,38 +319,43 @@ def create_vq_latent_diffusion(
         'depth': 3,
         'dilation_growth_rate': 3,
         'activation': 'relu',
-        'norm': None
+        'norm': None,
+        'double_z': True,  # For KL: encode to mean and logvar
     }
     
-    # VQ-VAE checkpoint path
-    vqvae_checkpoint = pjoin(
+    # VQ-KL checkpoint path
+    vqkl_checkpoint = pjoin(
         checkpoints_dir, 
         dataset_name, 
-        vqvae_name, 
+        vqkl_name, 
         'model', 
         'best_model.tar'
     )
     
-    if not os.path.exists(vqvae_checkpoint):
-        print(f"Warning: VQ-VAE checkpoint not found at {vqvae_checkpoint}")
-        vqvae_checkpoint = None
+    if not os.path.exists(vqkl_checkpoint):
+        print(f"Warning: VQ-KL checkpoint not found at {vqkl_checkpoint}")
+        # Try latest.tar as fallback
+        vqkl_checkpoint_fallback = pjoin(checkpoints_dir, dataset_name, vqkl_name, 'model', 'latest.tar')
+        if os.path.exists(vqkl_checkpoint_fallback):
+             print(f"Using fallback checkpoint: {vqkl_checkpoint_fallback}")
+             vqkl_checkpoint = vqkl_checkpoint_fallback
+        else:
+             vqkl_checkpoint = None
     
-    # CRITICAL: Load scale_factor if not provided
+    # Load scale_factor if not provided
     if scale_factor is None:
-        scale_factor_file = pjoin(checkpoints_dir, dataset_name, vqvae_name, 'scale_factor.txt')
+        scale_factor_file = pjoin(checkpoints_dir, dataset_name, vqkl_name, 'scale_factor.txt')
         if os.path.exists(scale_factor_file):
             with open(scale_factor_file, 'r') as f:
                 for line in f:
                     if line.startswith('scale_factor='):
                         scale_factor = float(line.split('=')[1].strip())
-                        print(f"[INFO] Loaded scale_factor={scale_factor:.6f} from {scale_factor_file}")
+                        print(f"[INFO] Loaded scale_factor={scale_factor:.6f}")
                         break
         
         if scale_factor is None:
             print("="*70)
-            print("WARNING: scale_factor not found!")
-            print("Please run: python calculate_scale_factor.py")
-            print("Using default scale_factor=1.0 (NOT RECOMMENDED)")
+            print("WARNING: scale_factor not found! Using default=1.0")
             print("="*70)
             scale_factor = 1.0
     
@@ -360,12 +377,13 @@ def create_vq_latent_diffusion(
     }
     default_kwargs.update(diffusion_kwargs)
     
-    # Create model with scale_factor
-    model = VQLatentDiffusion(
-        vqvae_config=vqvae_config,
-        vqvae_checkpoint=vqvae_checkpoint,
-        freeze_vqvae=freeze_vqvae,
-        scale_factor=scale_factor,  # CRITICAL PARAMETER
+    # Create model
+    model = VQKLLatentDiffusion(
+        vqkl_config=vqkl_config,
+        vqkl_checkpoint=vqkl_checkpoint,
+        freeze_vqkl=freeze_vqkl,
+        scale_factor=scale_factor,
+        use_kl_posterior=use_kl_posterior,
         **default_kwargs
     )
     

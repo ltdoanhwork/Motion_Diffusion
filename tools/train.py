@@ -2,7 +2,7 @@
 import numpy as np, torch
 from os.path import join as pjoin
 import os, sys
-# đảm bảo này trỏ tới project root (cha của tools/)
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
