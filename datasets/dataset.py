@@ -166,6 +166,11 @@ class Text2MotionDataset(data.Dataset):
             pos_one_hots = np.concatenate(pos_one_hots, axis=0)
             word_embeddings = np.concatenate(word_embeddings, axis=0)
             return word_embeddings, pos_one_hots, caption, sent_len, motion, m_length
+        
+        # ✅ THÊM: Random noise augmentation
+        if self.opt.is_train:
+            motion = motion + np.random.normal(0, 0.01, motion.shape)  # Small noise
+
         return caption, motion, m_length
     
 class Beat2MotionDataset(Dataset):

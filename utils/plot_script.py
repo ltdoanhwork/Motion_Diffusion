@@ -75,11 +75,19 @@ def plot_3d_motion(save_path, kinematic_tree, joints, title, figsize=(10, 10), f
     data[..., 2] -= data[:, 0:1, 2]
 
     #     print(trajec.shape)
+    
+    # Debug: check kinematic_tree
+    print(f"[DEBUG plot_3d_motion] kinematic_tree type: {type(kinematic_tree)}, length: {len(kinematic_tree) if kinematic_tree else 0}")
+    if kinematic_tree and len(kinematic_tree) > 0:
+        print(f"[DEBUG] First chain: {kinematic_tree[0]}")
 
     def update(index):
         #         print(index)
-        ax.lines = []
-        ax.collections = []
+        # Clear lines và collections (fix cho matplotlib 3.9+)
+        while ax.lines:
+            ax.lines[0].remove()
+        while ax.collections:
+            ax.collections[0].remove()
         ax.view_init(elev=120, azim=-90)
         ax.dist = 7.5
         #         ax =
@@ -93,7 +101,34 @@ def plot_3d_motion(save_path, kinematic_tree, joints, title, figsize=(10, 10), f
                       color='blue')
         #             ax = plot_xzPlane(ax, MINS[0], MAXS[0], 0, MINS[2], MAXS[2])
 
-        for i, (chain, color) in enumerate(zip(kinematic_tree, colors)):
+        # Vẽ bones từ kinematic_tree
+        if kinematic_tree:
+            for i, chain in enumerate(kinematic_tree):
+                color = colors[i % len(colors)]  # Cycle colors nếu chain nhiều hơn colors
+                linewidth = 4.0 if i < 5 else 2.0
+                try:
+                    ax.plot3D(data[index, chain, 0], data[index, chain, 1], data[index, chain, 2], 
+                              linewidth=linewidth, color=color)
+                except Exception as e:
+                    print(f"[DEBUG] Error plotting chain {i}: {e}, chain: {chain}")
+            
+            # Nếu kinematic_tree không cover toàn bộ joints, vẽ các joint còn lại dưới dạng scatter
+            covered_joints = set()
+            for chain in kinematic_tree:
+                covered_joints.update(chain)
+            
+            if len(covered_joints) < data.shape[1]:
+                # Có joints không được vẽ
+                remaining_joints = [j for j in range(data.shape[1]) if j not in covered_joints]
+                if remaining_joints:
+                    ax.scatter(data[index, remaining_joints, 0], 
+                              data[index, remaining_joints, 1],
+                              data[index, remaining_joints, 2],
+                              c='gray', s=5, alpha=0.6)
+        else:
+            # Fallback: vẽ tất cả joints dưới dạng scatter points
+            ax.scatter(data[index, :, 0], data[index, :, 1], data[index, :, 2],
+                      c='red', s=5)
             #             print(color)
             if i < 5:
                 linewidth = 4.0

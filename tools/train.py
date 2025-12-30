@@ -79,6 +79,18 @@ def create_train_split(motion_dir, split_file):
             f.write(f"{name}\n")
     print(f"Created {split_file}")
 
+def check_data_shape(motion_dir):
+    import glob
+    files = glob.glob(os.path.join(motion_dir, "**/*.npy"), recursive=True)
+    if not files:
+        print("Không tìm thấy file .npy nào!")
+        return 0, 0
+    
+    data = np.load(files[0])
+    print(f"1. Kiểm tra file: {files[0]}")
+    print(f"2. Shape gốc: {data.shape}") 
+    return data.shape[1] 
+
 # -----------------------------------------------------------
 # main
 # -----------------------------------------------------------
@@ -114,18 +126,22 @@ if __name__ == '__main__':
         kinematic_chain     = paramUtil.kit_kinematic_chain
         DatasetClass        = Text2MotionDataset
 
-    elif opt.dataset_name == 'beat':                           # ← NEW BRANCH
-        opt.data_root       = pjoin(ROOT, 'datasets/BEAT_numpy')   # absolute path
+    elif opt.dataset_name == 'beat':                          
+        opt.data_root       = pjoin(ROOT, 'datasets/BEAT_numpy')   
         opt.motion_dir      = pjoin(opt.data_root, 'npy')
         opt.text_dir        = pjoin(opt.data_root, 'txt')
-        opt.joints_num      = 55
+        opt.joints_num      = 88
         fps                 = 60
-        # choose a workable clip length for diffusion (e.g. ~6 s = 360 frames)
         opt.max_motion_length = 360
-        dim_pose            = 264                                # axis‑angle for 55 joints
-        # kinematic_chain     = paramUtil.beat_kinematic_chain     # add in paramUtil
+        real_dim_pose = check_data_shape(opt.motion_dir)
+        if real_dim_pose > 0:
+            dim_pose = real_dim_pose
+            print(f"Đã cập nhật dim_pose theo dữ liệu thật: {dim_pose}")
+        else:
+            dim_pose = 264                                
+        kinematic_chain     = paramUtil.beat_kinematic_chain 
         DatasetClass        = Beat2MotionDataset
-
+    
     else:
         raise KeyError(f'Unknown dataset {opt.dataset_name}')
 
@@ -155,7 +171,7 @@ if __name__ == '__main__':
     # -------------------------------------------------------
     # dataset & loader
     # -------------------------------------------------------
-    train_split = pjoin(opt.data_root, 'train.txt')             # ids list
+    train_split = pjoin(opt.data_root, 'train.txt')            
     
     # Auto-create train.txt if not exists (for BEAT dataset)
     if opt.dataset_name == 'beat':
@@ -164,4 +180,4 @@ if __name__ == '__main__':
     train_set   = DatasetClass(opt, mean, std, train_split, opt.times)
     bad_ids = validate_dataset(train_set)
     trainer.train(train_set)
-    print("🚀 Training complete!")
+    print("==> Training complete! Congratulations!")

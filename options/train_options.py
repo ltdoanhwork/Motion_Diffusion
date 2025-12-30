@@ -20,8 +20,8 @@ class TrainCompOptions(BaseOptions):
                                  help='What the model predicts (noise, v, or x0)')
         
         # ==================== Training Hyperparameters ====================
-        self.parser.add_argument('--num_epochs', type=int, default=50, help='Number of epochs')
-        self.parser.add_argument('--lr', type=float, default=2e-4, help='Learning rate')
+        self.parser.add_argument('--num_epochs', type=int, default=51, help='Number of epochs')
+        self.parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
         self.parser.add_argument('--batch_size', type=int, default=32, help='Batch size per GPU')
         self.parser.add_argument('--times', type=int, default=1, help='times of dataset')
         self.parser.add_argument('--feat_bias', type=float, default=25, help='Scales for global motion features and foot contact')
@@ -33,12 +33,16 @@ class TrainCompOptions(BaseOptions):
                                  help='Use acceleration matching loss for motion dynamics')
         self.parser.add_argument('--use_geometric_loss', action='store_true',
                                  help='Use geometric consistency loss (bone length)')
+        self.parser.add_argument('--use_fk_loss', action='store_true',
+                                 help='Use forward kinematics (FK) loss for global position accuracy')
         self.parser.add_argument('--velocity_weight', type=float, default=0.5,
                                  help='Weight for velocity loss')
         self.parser.add_argument('--acceleration_weight', type=float, default=0.1,
                                  help='Weight for acceleration loss')
         self.parser.add_argument('--geometric_weight', type=float, default=0.3,
                                  help='Weight for geometric loss')
+        self.parser.add_argument('--fk_weight', type=float, default=1.0,
+                                 help='Weight for forward kinematics (FK) loss')
 
         # ==================== Training Improvements ====================
         self.parser.add_argument('--ema_decay', type=float, default=0.9999,
@@ -53,15 +57,14 @@ class TrainCompOptions(BaseOptions):
         # ==================== Classifier-Free Guidance ====================
         self.parser.add_argument('--cfg_dropout', type=float, default=0.1,
                                  help='Probability to drop text condition for CFG training')
-        self.parser.add_argument('--cfg_scale', type=float, default=7.5,
+        self.parser.add_argument('--cfg_scale', type=float, default=4.5,
                                  help='CFG scale for inference (1.0 = no guidance)')
 
         # ==================== Checkpointing & Logging ====================
         self.parser.add_argument('--is_continue', action="store_true", help='Is this trail continued from previous trail?')
         self.parser.add_argument('--log_every', type=int, default=50, help='Frequency of printing training progress (by iteration)')
-        self.parser.add_argument('--save_every_e', type=int, default=5, help='Frequency of saving models (by epoch)')
-        self.parser.add_argument('--eval_every_e', type=int, default=5, help='Frequency of animation results (by epoch)')
+        self.parser.add_argument('--save_every_e', type=int, default=10, help='Frequency of saving models (by epoch)')
+        self.parser.add_argument('--eval_every_e', type=int, default=10, help='Frequency of animation results (by epoch)')
         self.parser.add_argument('--save_latest', type=int, default=500, help='Frequency of saving models (by iteration)')
         
         self.is_train = True
-

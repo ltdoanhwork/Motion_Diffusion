@@ -281,7 +281,8 @@ class ModelMeanType(enum.Enum):
     PREVIOUS_X = enum.auto()  # the model predicts x_{t-1}
     START_X = enum.auto()  # the model predicts x_0
     EPSILON = enum.auto()  # the model predicts epsilon
-
+    VELOCITY = enum.auto()  # the model predicts velocity
+    
 
 class ModelVarType(enum.Enum):
     """
@@ -452,6 +453,13 @@ class GaussianDiffusion:
                 )[0],
                 ModelMeanType.START_X: x_start,
                 ModelMeanType.EPSILON: noise,
+                
+                # --- THÊM ĐOẠN NÀY VÀO ---
+                ModelMeanType.VELOCITY: (
+                    _extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * noise
+                    - _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * x_start
+                ),
+                # -------------------------
             }[self.model_mean_type]
             
             assert model_output.shape == target.shape == x_start.shape
@@ -471,6 +479,10 @@ class GaussianDiffusion:
                     pred_latent = self._predict_xstart_from_eps(x_t=x_t, t=t, eps=model_output)
                 elif self.model_mean_type == ModelMeanType.START_X:
                     pred_latent = model_output
+                # --- THÊM KHỐI NÀY ---
+                elif self.model_mean_type == ModelMeanType.VELOCITY:
+                    pred_latent = self._predict_xstart_from_v(x_t=x_t, t=t, v=model_output)
+                # ---------------------
                 else:  # PREVIOUS_X
                     pred_latent = self._predict_xstart_from_xprev(x_t=x_t, t=t, xprev=model_output)
                 
@@ -536,6 +548,13 @@ class GaussianDiffusion:
                 )[0],
                 ModelMeanType.START_X: x_start,
                 ModelMeanType.EPSILON: noise,
+
+                # --- THÊM ĐOẠN NÀY VÀO ---
+                ModelMeanType.VELOCITY: (
+                    _extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * noise
+                    - _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * x_start
+                ),
+                # -------------------------
             }[self.model_mean_type]
             
             assert model_output.shape == target.shape == x_start.shape
@@ -729,9 +748,17 @@ class GaussianDiffusion:
                 self._predict_xstart_from_xprev(x_t=x, t=t, xprev=model_output)
             )
             model_mean = model_output
-        elif self.model_mean_type in [ModelMeanType.START_X, ModelMeanType.EPSILON]:
+        elif self.model_mean_type in [ModelMeanType.START_X, ModelMeanType.EPSILON, ModelMeanType.VELOCITY]:
             if self.model_mean_type == ModelMeanType.START_X:
                 pred_xstart = process_xstart(model_output)
+
+            # === KHỐI LOGIC MỚI CHO VELOCITY ===
+            elif self.model_mean_type == ModelMeanType.VELOCITY:
+                # Tính x0 từ v-prediction
+                pred_xstart = process_xstart(
+                    self._predict_xstart_from_v(x_t=x, t=t, v=model_output)
+                )
+            # ===================================
             else:
                 pred_xstart = process_xstart(
                     self._predict_xstart_from_eps(x_t=x, t=t, eps=model_output)
@@ -758,6 +785,15 @@ class GaussianDiffusion:
             _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
             - _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * eps
         )
+    
+    # --- THÊM ĐOẠN NÀY ---
+    def _predict_xstart_from_v(self, x_t, t, v):
+        assert x_t.shape == v.shape
+        return (
+            _extract_into_tensor(self.sqrt_alphas_cumprod, t, x_t.shape) * x_t
+            - _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape) * v
+        )
+    # ---------------------
 
     def _predict_xstart_from_xprev(self, x_t, t, xprev):
         assert x_t.shape == xprev.shape
@@ -1254,6 +1290,13 @@ class GaussianDiffusion:
                 )[0],
                 ModelMeanType.START_X: x_start,
                 ModelMeanType.EPSILON: noise,
+
+                # --- THÊM DÒNG NÀY ---
+                ModelMeanType.VELOCITY: (
+                    _extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * noise
+                    - _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * x_start
+                ),
+                # ---------------------
             }[self.model_mean_type]
             assert model_output.shape == target.shape == x_start.shape
             terms["mse"] = mean_flat((target - model_output) ** 2).view(-1, 1).mean(-1)

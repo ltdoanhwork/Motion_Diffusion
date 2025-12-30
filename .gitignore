@@ -1,10 +1,9 @@
 datasets/BEAT_numpy_old
+datasets/BEAT_numpy_v0
 datasets/BEAT_numpy
 datasets/BEAT
-datasets/BEAT_
-datasets/BEAT_beta
 datasets/BEAT_indices
-datasets/step1_fit_scaler.py
+datasets/2_scott_0_55_55.bvh
 datasets/pymo/demos/data
 
 emage_evaltools/smplx_models/smplx/SMPLX_NEUTRAL_2020.npz
