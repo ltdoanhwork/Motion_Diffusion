@@ -315,23 +315,65 @@ class DDPMTrainer(object):
         except:
             self.src_mask = self.encoder.generate_src_mask(T, cur_len).to(x_start.device)
 
-    def generate_batch(self, caption, m_lens, dim_pose):
+    def generate_batch(self, caption, m_lens, dim_pose, guidance_scale=4.5):
+        # 1. Encode text thật
         xf_proj, xf_out = self.encoder.encode_text(caption, self.device)
-        
+
+        # 2. Encode text rỗng (Unconditional)
         B = len(caption)
+        uncond_caption = [""] * B
+        xf_proj_uncond, xf_out_uncond = self.encoder.encode_text(uncond_caption, self.device)
+        
+        # --- MODEL WRAPPER ---
+        def model_fn(x, t, **kwargs):
+            # Lấy cond và uncond từ kwargs
+            cond_dict = kwargs.get('cond')
+            uncond_dict = kwargs.get('uncond')
+            
+            if cond_dict is None or uncond_dict is None:
+                 # Fallback phòng trường hợp library truyền tham số kiểu khác
+                 # (Thường không vào đây nếu gọi đúng chuẩn)
+                 return self.encoder(x, t, **kwargs)
+
+            # x_in: (2*B, T, D)
+            x_in = torch.cat([x, x], dim=0)
+            t_in = torch.cat([t, t], dim=0)
+            
+            # Gộp các key trong dictionary
+            combined_kwargs = {}
+            for k in cond_dict.keys():
+                if torch.is_tensor(cond_dict[k]):
+                    combined_kwargs[k] = torch.cat([cond_dict[k], uncond_dict[k]], dim=0)
+                else:
+                    # Nếu là list (như mask length), cộng list lại
+                    combined_kwargs[k] = cond_dict[k] + uncond_dict[k]
+
+            # Unpack dictionary để truyền đúng vào các tham số (length, xf_proj, xf_out...)
+            out_combined = self.encoder(x_in, t_in, **combined_kwargs)
+            
+            # Tách kết quả ra
+            out_cond, out_uncond = torch.split(out_combined, B, dim=0)
+            
+            # Công thức CFG
+            return out_uncond + guidance_scale * (out_cond - out_uncond)
+
         T = min(m_lens.max(), self.encoder.num_frames)
+
+        # Gọi p_sample_loop
         output = self.diffusion.p_sample_loop(
-            self.encoder,
+            model_fn,
             (B, T, dim_pose),
-            clip_denoised=False, 
+            clip_denoised=False,
             progress=True,
             model_kwargs={
-                'xf_proj': xf_proj,
-                'xf_out': xf_out,
-                'length': m_lens
-            })
+                'cond': {'xf_proj': xf_proj, 'xf_out': xf_out, 'length': m_lens},
+                'uncond': {'xf_proj': xf_proj_uncond, 'xf_out': xf_out_uncond, 'length': m_lens}
+            },
+            device=self.device 
+        )
+        
         return output
-
+    
     def generate(self, caption, m_lens, dim_pose, batch_size=1024):
         model_to_use = self.encoder_ema if self.encoder_ema is not None else self.encoder
         N = len(caption)
