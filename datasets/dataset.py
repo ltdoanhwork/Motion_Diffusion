@@ -183,8 +183,8 @@ class Beat2MotionDataset(Dataset):
     def __init__(
         self,
         opt,                       # Hyper‑parameters & paths holder (any object with the attrs below)
-        mean: np.ndarray | None,   # motion mean vector  (D,)
-        std:  np.ndarray | None,   # motion std  vector  (D,)
+        mean,                       # motion mean vector  (D,) or None
+        std,                        # motion std  vector  (D,) or None
         split_file: str,           # txt: list of clip ids to load
         times: int = 1,            # dataset “augmentation” factor
         w_vectorizer=None,         # optional word ⇒ (embedding, POS‑one‑hot)
@@ -207,7 +207,8 @@ class Beat2MotionDataset(Dataset):
         with cs.open(split_file, 'r', encoding='utf‑8') as f:
             clip_ids = [ln.strip() for ln in f if ln.strip()]
 
-        self.data_dict, name_lens = {}, []
+        self.data_dict = {}
+        expected_dim = None
         for cid in tqdm(clip_ids, desc='Loading motion‑text pairs'):
             try:
                 motion_path = pjoin(opt.motion_dir, f'{cid}.npy')
@@ -226,6 +227,9 @@ class Beat2MotionDataset(Dataset):
                 # if T < self.min_len or T >= 200:
                 #     continue
                 T, D = motion_raw.shape
+                if T == 0 or D == 0:
+                    print(f"[WARN] skip {cid}: invalid shape {motion_raw.shape}")
+                    continue
                 # ----- optional representation conversion -----
                 betas = None         # BEAT stores body shape; keep None if you do not use it
                 # if self.use_rep == 'rep15d':
@@ -242,6 +246,16 @@ class Beat2MotionDataset(Dataset):
                     motion_proc = motion_raw
                 else:
                     raise ValueError(f"motion_rep '{self.use_rep}' không được hỗ trợ hoặc không khớp với dữ liệu .npy")
+                if motion_proc.ndim != 2 or motion_proc.shape[0] == 0 or motion_proc.shape[1] == 0:
+                    print(f"[WARN] skip {cid}: processed invalid shape {motion_proc.shape}")
+                    continue
+                if expected_dim is None:
+                    expected_dim = motion_proc.shape[1]
+                elif motion_proc.shape[1] != expected_dim:
+                    print(
+                        f"[WARN] skip {cid}: dim mismatch {motion_proc.shape[1]} != {expected_dim}"
+                    )
+                    continue
 
                 # ----- load caption(s) -----
                 with cs.open(txt_path, 'r', encoding='utf‑8') as f:
@@ -278,6 +292,8 @@ class Beat2MotionDataset(Dataset):
 
         # Sort by length for easier curriculum‑style batching
         self.name_list = sorted(self.data_dict, key=lambda n: self.data_dict[n]['length'])
+        if not self.name_list:
+            raise ValueError("No valid BEAT samples were loaded after filtering invalid motions.")
         self.length_arr = np.array([self.data_dict[n]['length'] for n in self.name_list])
 
         # -------------------------------------------------
@@ -285,7 +301,10 @@ class Beat2MotionDataset(Dataset):
         # -------------------------------------------------
         if opt.is_train and (mean is None or std is None):
             print('Computing dataset mean / std …')
-            all_motion = np.concatenate([self.data_dict[n]['motion'] for n in self.name_list], 0)
+            motions = [self.data_dict[n]['motion'] for n in self.name_list if self.data_dict[n]['motion'].size > 0]
+            if not motions:
+                raise ValueError("No non-empty motions available to compute mean/std.")
+            all_motion = np.concatenate(motions, 0)
             mean = all_motion.mean(0)
             std = all_motion.std(0) + 1e-8
             np.save(pjoin(opt.meta_dir, 'mean.npy'), mean)
@@ -353,8 +372,26 @@ class Beat2MotionDataset(Dataset):
             caption = text_d.get('caption', '<no caption>')
             if not isinstance(caption, str):
                 raise TypeError(f"caption is not string: {caption}")
-            # print(f"[INFO] {name} | len: {m_len} | caption: {caption}")
-            # print(f"  motion shape: {motion.shape} ")
+
+            if self.eval_mode:
+                if self.w_vectorizer is None:
+                    raise ValueError("eval_mode=True requires w_vectorizer")
+                tokens = text_d.get('tokens', caption.split(' '))
+                tokens = tokens[:self.opt.max_text_len]
+                tokens = ['sos/OTHER'] + tokens + ['eos/OTHER']
+                sent_len = len(tokens)
+                tokens += ['unk/OTHER'] * (self.opt.max_text_len + 2 - sent_len)
+
+                pos_one_hots = []
+                word_embeddings = []
+                for tok in tokens:
+                    word_emb, pos_oh = self.w_vectorizer[tok]
+                    pos_one_hots.append(pos_oh[None, :])
+                    word_embeddings.append(word_emb[None, :])
+                pos_one_hots = np.concatenate(pos_one_hots, axis=0)
+                word_embeddings = np.concatenate(word_embeddings, axis=0)
+                return word_embeddings, pos_one_hots, caption, sent_len, motion.astype(np.float32), m_len, '_'.join(tokens)
+
             return caption, motion.astype(np.float32), m_len
 
         except Exception as e:

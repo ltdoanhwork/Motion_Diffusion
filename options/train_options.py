@@ -12,7 +12,7 @@ class TrainCompOptions(BaseOptions):
 
         # ==================== Diffusion Settings ====================
         self.parser.add_argument('--diffusion_steps', type=int, default=1000, help='diffusion_steps of transformer')
-        self.parser.add_argument('--beta_schedule', type=str, default='cosine',
+        self.parser.add_argument('--beta_schedule', type=str, default='linear',
                                  choices=['linear', 'cosine', 'scaled_linear'],
                                  help='Beta schedule for diffusion process')
         self.parser.add_argument('--prediction_type', type=str, default='epsilon',
@@ -25,6 +25,10 @@ class TrainCompOptions(BaseOptions):
         self.parser.add_argument('--batch_size', type=int, default=32, help='Batch size per GPU')
         self.parser.add_argument('--times', type=int, default=1, help='times of dataset')
         self.parser.add_argument('--feat_bias', type=float, default=25, help='Scales for global motion features and foot contact')
+        self.parser.add_argument('--test_ratio', type=float, default=0.1,
+                                 help='Split ratio for test.txt when auto-creating BEAT splits')
+        self.parser.add_argument('--split_seed', type=int, default=3407,
+                                 help='Random seed used for train/test split generation')
         
         # ==================== Motion-Specific Losses ====================
         self.parser.add_argument('--use_velocity_loss', action='store_true',

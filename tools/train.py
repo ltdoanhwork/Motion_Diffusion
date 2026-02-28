@@ -44,40 +44,52 @@ def validate_dataset(dataset):
     print(f"✅ Tổng số lỗi: {len(bad_samples)} / {len(dataset)}")
     return bad_samples
 
-def create_train_split(motion_dir, split_file):
-    """Create train.txt by listing all .npy files in motion_dir.
-    
-    Args:
-        motion_dir: Path to directory containing .npy motion files
-        split_file: Path to output train.txt
-    """
-    if os.path.exists(split_file):
-        print(f"[INFO] {split_file} already exists")
+def create_train_test_splits(motion_dir, train_file, test_file, test_ratio=0.1, split_seed=3407):
+    """Create train.txt and test.txt by scanning .npy files and splitting by ratio."""
+    if os.path.exists(train_file) and os.path.exists(test_file):
+        print(f"[INFO] {train_file} and {test_file} already exist")
         return
-        
-    os.makedirs(os.path.dirname(split_file), exist_ok=True)
+
+    if not (0.0 < test_ratio < 1.0):
+        raise ValueError(f"test_ratio must be in (0,1), got {test_ratio}")
+
+    os.makedirs(os.path.dirname(train_file), exist_ok=True)
+
     # Walk recursively so we pick up .npy files inside subfolders (e.g. npy/1/*.npy)
     motion_files = []
     for root, _, files in os.walk(motion_dir):
         for f in files:
             if f.endswith('.npy'):
                 full = os.path.join(root, f)
-                # write relative path from motion_dir, without extension
                 rel = os.path.relpath(full, motion_dir)
                 name = os.path.splitext(rel)[0]
-                # normalize to use os.sep (Dataset will join with motion_dir)
-                motion_files.append(name)
-    
+                motion_files.append(name.replace('\\', '/'))
+
     if not motion_files:
         raise ValueError(f"No .npy files found in {motion_dir}")
-        
+
+    motion_files = sorted(set(motion_files))
     print(f"Found {len(motion_files)} motion files")
-    # Sort for deterministic ordering; use os.path.normpath before sort to keep consistent
-    motion_files_sorted = sorted(motion_files, key=lambda x: x.replace('\\', '/'))
-    with open(split_file, 'w', encoding='utf-8') as f:
-        for name in motion_files_sorted:
+
+    rng = np.random.RandomState(split_seed)
+    shuffled_idx = rng.permutation(len(motion_files))
+    n_test = max(1, int(round(len(motion_files) * test_ratio)))
+    n_test = min(n_test, len(motion_files) - 1)
+
+    test_idx = set(shuffled_idx[:n_test].tolist())
+    train_ids = [motion_files[i] for i in range(len(motion_files)) if i not in test_idx]
+    test_ids = [motion_files[i] for i in range(len(motion_files)) if i in test_idx]
+
+    with open(train_file, 'w', encoding='utf-8') as f:
+        for name in train_ids:
             f.write(f"{name}\n")
-    print(f"Created {split_file}")
+
+    with open(test_file, 'w', encoding='utf-8') as f:
+        for name in test_ids:
+            f.write(f"{name}\n")
+
+    print(f"Created {train_file} ({len(train_ids)} samples)")
+    print(f"Created {test_file} ({len(test_ids)} samples)")
 
 def check_data_shape(motion_dir):
     import glob
@@ -171,11 +183,18 @@ if __name__ == '__main__':
     # -------------------------------------------------------
     # dataset & loader
     # -------------------------------------------------------
-    train_split = pjoin(opt.data_root, 'train.txt')            
+    train_split = pjoin(opt.data_root, 'train.txt')
+    test_split = pjoin(opt.data_root, 'test.txt')
     
-    # Auto-create train.txt if not exists (for BEAT dataset)
+    # Auto-create train.txt + test.txt if not exists (for BEAT dataset)
     if opt.dataset_name == 'beat':
-        create_train_split(opt.motion_dir, train_split)
+        create_train_test_splits(
+            opt.motion_dir,
+            train_split,
+            test_split,
+            test_ratio=opt.test_ratio,
+            split_seed=opt.split_seed
+        )
 
     train_set   = DatasetClass(opt, mean, std, train_split, opt.times)
     bad_ids = validate_dataset(train_set)

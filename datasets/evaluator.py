@@ -7,23 +7,82 @@ from os.path import join as pjoin
 from tqdm import tqdm
 import numpy as np
 from .evaluator_models import *
+from .dataset import Beat2MotionDataset
 import os
+import glob
 import codecs as cs
 import random
 from torch.utils.data._utils.collate import default_collate
 
 
+def _repo_root():
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _resolve_glove_path():
+    env_path = os.environ.get('GLOVE_DIR')
+    if env_path and os.path.exists(env_path):
+        return env_path
+    candidates = [
+        pjoin(_repo_root(), 'data', 'glove'),
+        pjoin(_repo_root(), 'datasets', 'glove'),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return None
+
+
+class DummyWordVectorizer:
+    def __init__(self, word_dim=300):
+        self.word_dim = word_dim
+        self.pos_dim = len(POS_enumerator)
+
+    def __getitem__(self, token):
+        word_emb = np.zeros((self.word_dim,), dtype=np.float32)
+        pos_oh = np.zeros((self.pos_dim,), dtype=np.float32)
+        pos_oh[0] = 1.0
+        return word_emb, pos_oh
+
+
+def _get_word_vectorizer():
+    glove_path = _resolve_glove_path()
+    if glove_path is None:
+        print("[WARN] GloVe not found. Falling back to dummy word embeddings.")
+        return DummyWordVectorizer()
+    return WordVectorizer(glove_path, 'our_vab')
+
+
+def _resolve_checkpoint(opt):
+    direct = pjoin(opt.model_dir, f"{opt.which_epoch}.tar")
+    if os.path.exists(direct):
+        return direct
+    # Fallback: pick latest ckpt_eXXX.tar
+    pattern = os.path.join(opt.model_dir, "ckpt_e*.tar")
+    ckpts = sorted(glob.glob(pattern))
+    if not ckpts:
+        raise FileNotFoundError(f"No checkpoints found in {opt.model_dir}")
+    return ckpts[-1]
+
+
 class EvaluationDataset(Dataset):
 
     def __init__(self, opt, trainer, dataset, w_vectorizer, mm_num_samples, mm_num_repeats):
-        assert mm_num_samples < len(dataset)
+        if len(dataset) <= 1:
+            raise ValueError("Dataset too small for evaluation")
+        mm_num_samples = min(mm_num_samples, len(dataset) - 1)
         print(opt.model_dir)
 
         dataloader = DataLoader(dataset, batch_size=1, num_workers=1, shuffle=True)
-        # epoch, it = trainer.load(pjoin(opt.model_dir, opt.which_epoch + '.tar'))
-        epoch, it = trainer.load('/home/ltdoanh/jupyter/jupyter/ldtan/MotionDiffuse/t2m/t2m_new_ver2/model/ckpt_e030.tar')
+        ckpt_path = _resolve_checkpoint(opt)
+        epoch, it = trainer.load(ckpt_path)
         generated_motion = []
-        min_mov_length = 10 if opt.dataset_name == 't2m' else 6
+        if opt.dataset_name == 't2m':
+            min_mov_length = 10
+        elif opt.dataset_name == 'kit':
+            min_mov_length = 6
+        else:
+            min_mov_length = 10
 
         trainer.eval_mode()
         trainer.to(opt.device)
@@ -284,12 +343,45 @@ def get_dataset_motion_loader(opt_path, batch_size, device):
     if opt.dataset_name == 't2m' or opt.dataset_name == 'kit':
         print('Loading dataset %s ...' % opt.dataset_name)
 
+        if opt.dataset_name == 't2m':
+            opt.data_root = pjoin(_repo_root(), 'datasets', 'HumanML3D', 'HumanML3D')
+            opt.motion_dir = pjoin(opt.data_root, 'new_joint_vecs')
+            opt.text_dir = pjoin(opt.data_root, 'texts')
+            opt.joints_num = 22
+            opt.max_motion_length = 196
+            opt.dim_pose = 263
+        else:
+            opt.data_root = pjoin(_repo_root(), 'datasets', 'KIT-ML')
+            opt.motion_dir = pjoin(opt.data_root, 'new_joint_vecs')
+            opt.text_dir = pjoin(opt.data_root, 'texts')
+            opt.joints_num = 21
+            opt.max_motion_length = 196
+            opt.dim_pose = 251
+
         mean = np.load(pjoin(opt.meta_dir, 'mean.npy'))
         std = np.load(pjoin(opt.meta_dir, 'std.npy'))
-        path = '/home/ltdoanh/jupyter/jupyter/ldtan/MotionDiffuse/glove'
-        w_vectorizer = WordVectorizer(path, 'our_vab')
+        w_vectorizer = _get_word_vectorizer()
         split_file = pjoin(opt.data_root, 'test.txt')
         dataset = Text2MotionDatasetV2(opt, mean, std, split_file, w_vectorizer)
+        dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=4, drop_last=False,
+                                collate_fn=collate_fn, shuffle=True)
+    elif opt.dataset_name == 'beat':
+        print('Loading dataset %s ...' % opt.dataset_name)
+        # Minimal BEAT setup (mirrors tools/train.py)
+        opt.data_root = pjoin(_repo_root(), 'datasets', 'BEAT_numpy')
+        opt.motion_dir = pjoin(opt.data_root, 'npy')
+        opt.text_dir = pjoin(opt.data_root, 'txt')
+        opt.joints_num = 88
+        opt.max_motion_length = getattr(opt, 'max_motion_length', 360)
+        opt.dim_pose = getattr(opt, 'dim_pose', 264)
+
+        mean = np.load(pjoin(opt.meta_dir, 'mean.npy'))
+        std = np.load(pjoin(opt.meta_dir, 'std.npy'))
+        w_vectorizer = _get_word_vectorizer()
+        split_file = pjoin(opt.data_root, 'val.txt')
+        if not os.path.exists(split_file):
+            split_file = pjoin(opt.data_root, 'test.txt')
+        dataset = Beat2MotionDataset(opt, mean, std, split_file, opt.times, w_vectorizer=w_vectorizer, eval_mode=True)
         dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=4, drop_last=True,
                                 collate_fn=collate_fn, shuffle=True)
     else:
@@ -338,7 +430,9 @@ def get_motion_loader(opt, batch_size, trainer, ground_truth_dataset, mm_num_sam
 
     # Currently the configurations of two datasets are almost the same
     if opt.dataset_name == 't2m' or opt.dataset_name == 'kit':
-        w_vectorizer = WordVectorizer('/home/ltdoanh/jupyter/jupyter/ldtan/MotionDiffuse/glove', 'our_vab')
+        w_vectorizer = _get_word_vectorizer()
+    elif opt.dataset_name == 'beat':
+        w_vectorizer = _get_word_vectorizer()
     else:
         raise KeyError('Dataset not recognized!!')
     print('Generating %s ...' % opt.name)

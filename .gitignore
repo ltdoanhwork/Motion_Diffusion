@@ -1,17 +1,89 @@
-datasets/BEAT_numpy_old
-datasets/BEAT_numpy_v0
-datasets/BEAT_numpy
-datasets/BEAT
-datasets/BEAT_indices
-datasets/2_scott_0_55_55.bvh
-datasets/pymo/demos/data
+# ------------------------------
+# Python cache / build artifacts
+# ------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
 
+# ------------------------------
+# Virtual environments
+# ------------------------------
+.venv/
+venv/
+env/
+ENV/
+.conda/
+
+# ------------------------------
+# Jupyter
+# ------------------------------
+.ipynb_checkpoints/
+
+# ------------------------------
+# IDE / editor
+# ------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ------------------------------
+# OS files
+# ------------------------------
+.DS_Store
+Thumbs.db
+
+# ------------------------------
+# Logs / runtime outputs
+# ------------------------------
+*.log
+*.out
+output.txt
+
+# ------------------------------
+# Training artifacts
+# ------------------------------
+checkpoints/
+results/
+runs/
+wandb/
+scripts/
+taming/
+
+# ------------------------------
+# Large local datasets / generated data
+# ------------------------------
+datasets/BEAT/
+datasets/BEAT_numpy/
+datasets/BEAT_numpy_/
+datasets/BEAT_numpy_old/
+datasets/BEAT_indices/
+datasets/HumanML3D/
+datasets/KIT-ML/
+
+emage_evaltools/
+
+# Generated split/stat files
+**/train.txt
+**/test.txt
+**/mean.npy
+**/std.npy
+
+# ------------------------------
+# Local model/data artifacts
+# ------------------------------
+*.pt
+*.pth
+*.ckpt
+*.tar
+*.pkl
+
+# Local utility outputs
+hf_*
+global_pipeline*.pkl
 emage_evaltools/smplx_models/smplx/SMPLX_NEUTRAL_2020.npz
-
-checkpoints
-global_pipeline.pkl
-global_pipeline_0.pkl
-latent-diffusion
-results
-taming
-scripts

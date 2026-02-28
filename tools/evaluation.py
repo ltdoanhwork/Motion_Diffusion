@@ -1,8 +1,18 @@
 from datetime import datetime
+import glob
+import os
+import sys
+from os.path import join as pjoin
+
 import numpy as np
 import torch
-import sys
-sys.path.append('/home/ltdoanh/jupyter/jupyter/ldtan/MotionDiffuse/text2motion')
+import tqdm
+from torch.utils.data import Dataset, DataLoader
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
 from datasets import get_dataset_motion_loader, get_motion_loader
 from models import MotionTransformer
 from utils.get_opt import get_opt
@@ -13,12 +23,9 @@ from utils.plot_script import *
 from utils import paramUtil
 from utils.utils import *
 from trainers import DDPMTrainer
-from sklearn.metrics import mean_absolute_error
 from utils.motion_process import recover_from_ric
-from os.path import join as pjoin
-import sys
-import tqdm
-from torch.utils.data import Dataset, DataLoader
+
+
 def build_models(opt, dim_pose):
     encoder = MotionTransformer(
         input_feats=dim_pose,
@@ -32,8 +39,64 @@ def build_models(opt, dim_pose):
 
 
 torch.multiprocessing.set_sharing_strategy('file_system')
-# 
-def MAE_score(groundtruth_loader, trainers, gt_dataset, dim=3):
+
+
+def _infer_dim_pose(motion_dir, default_dim):
+    try:
+        files = glob.glob(os.path.join(motion_dir, "**/*.npy"), recursive=True)
+        if not files:
+            return default_dim
+        arr = np.load(files[0])
+        if arr.ndim == 3 and arr.shape[0] == 1:
+            arr = arr.squeeze(0)
+        if arr.ndim == 2:
+            return arr.shape[1]
+    except Exception:
+        return default_dim
+    return default_dim
+
+
+def _setup_dataset(opt):
+    if opt.dataset_name == 't2m':
+        opt.data_root = pjoin(ROOT, 'datasets', 'HumanML3D', 'HumanML3D')
+        opt.motion_dir = pjoin(opt.data_root, 'new_joint_vecs')
+        opt.text_dir = pjoin(opt.data_root, 'texts')
+        opt.joints_num = 22
+        opt.max_motion_length = 196
+        opt.dim_pose = 263
+        kinematic_chain = paramUtil.t2m_kinematic_chain
+    elif opt.dataset_name == 'kit':
+        opt.data_root = pjoin(ROOT, 'datasets', 'KIT-ML')
+        opt.motion_dir = pjoin(opt.data_root, 'new_joint_vecs')
+        opt.text_dir = pjoin(opt.data_root, 'texts')
+        opt.joints_num = 21
+        opt.max_motion_length = 196
+        opt.dim_pose = 251
+        kinematic_chain = paramUtil.kit_kinematic_chain
+    elif opt.dataset_name == 'beat':
+        opt.data_root = pjoin(ROOT, 'datasets', 'BEAT_numpy')
+        opt.motion_dir = pjoin(opt.data_root, 'npy')
+        opt.text_dir = pjoin(opt.data_root, 'txt')
+        opt.joints_num = 88
+        opt.max_motion_length = 360
+        opt.dim_pose = _infer_dim_pose(opt.motion_dir, 264)
+        kinematic_chain = paramUtil.beat_kinematic_chain
+    else:
+        raise KeyError(f'Unknown dataset {opt.dataset_name}')
+    return kinematic_chain
+
+
+def _resolve_checkpoint(opt):
+    direct = pjoin(opt.model_dir, f"{opt.which_epoch}.tar")
+    if os.path.exists(direct):
+        return direct
+    ckpts = sorted(glob.glob(pjoin(opt.model_dir, "ckpt_e*.tar")))
+    if not ckpts:
+        raise FileNotFoundError(f"No checkpoints found in {opt.model_dir}")
+    return ckpts[-1]
+
+
+def MAE_score(groundtruth_loader, trainers, gt_dataset, mean, std, dim=3, mm_num_samples=100, mm_num_repeats=10):
     """Compute Mean Absolute Error (MAE), Velocity, and Jerk
 
     Args:
@@ -47,13 +110,11 @@ def MAE_score(groundtruth_loader, trainers, gt_dataset, dim=3):
         jerk:         Jerk error between original and predicted for each joint
     """
     dataloader = DataLoader(gt_dataset, batch_size=1, num_workers=1, shuffle=True)
-    epoch, it = trainers.load('/home/ltdoanh/jupyter/jupyter/ldtan/MotionDiffuse/t2m/t2m_new_ver2/model/ckpt_e030.tar')
     trainers.eval_mode()
     trainers.to(opt.device)
-    mean = np.load('/home/ltdoanh/jupyter/jupyter/ldtan/MotionDiffuse/t2m/t2m_new_ver2/meta/mean.npy')
-    std = np.load('/home/ltdoanh/jupyter/jupyter/ldtan/MotionDiffuse/t2m/t2m_new_ver2/meta/std.npy')
 
     mm_generated_motions = []
+    mm_num_samples = min(mm_num_samples, len(gt_dataset))
     mm_idxs = np.random.choice(len(gt_dataset), mm_num_samples, replace=False)
     mm_idxs = np.sort(mm_idxs)
     all_caption = []
@@ -69,8 +130,8 @@ def MAE_score(groundtruth_loader, trainers, gt_dataset, dim=3):
             mm_num_now = len(mm_generated_motions)
             is_mm = True if ((mm_num_now < mm_num_samples) and (i == mm_idxs[mm_num_now])) else False
             repeat_times = mm_num_repeats if is_mm else 1
-            m_lens = max(m_lens // opt.unit_length * opt.unit_length, min_mov_length * opt.unit_length)
-            m_lens = min(m_lens, opt.max_motion_length)
+            m_lens = (m_lens // opt.unit_length) * opt.unit_length
+            m_lens = torch.clamp(m_lens, min=min_mov_length * opt.unit_length, max=opt.max_motion_length)
             if isinstance(m_lens, int):
                 m_lens = torch.LongTensor([m_lens]).to(opt.device)
             else:
@@ -78,7 +139,7 @@ def MAE_score(groundtruth_loader, trainers, gt_dataset, dim=3):
             for t in range(repeat_times):
                 all_m_lens.append(m_lens)
                 all_caption.extend(caption)
-                all_motion.append(motions)  # Adjusting motion dimensions to match predicted
+                all_motion.append(motions.cpu().numpy())
             if is_mm:
                 mm_generated_motions.append(0)
     all_m_lens = torch.stack(all_m_lens)
@@ -86,12 +147,10 @@ def MAE_score(groundtruth_loader, trainers, gt_dataset, dim=3):
     # Generate all sequences
     with torch.no_grad():
         predicted = trainers.generate(all_caption, all_m_lens, opt.dim_pose)
-        # print(predicted.shape)
-        predicted = torch.stack(predicted , dim=0).cpu().numpy()
+        predicted = torch.stack(predicted, dim=0).cpu().numpy()
         predicted = predicted * std + mean
-        print(predicted.shape)
-        predicted = recover_from_ric(torch.from_numpy(predicted).float(), 22).numpy()
-        print(predicted.shape)
+        if opt.dataset_name in ['t2m', 'kit']:
+            predicted = recover_from_ric(torch.from_numpy(predicted).float(), opt.joints_num).numpy()
         print(len(all_motion))
         # original = np.concatenate(all_motion, axis=0)
         
@@ -101,14 +160,16 @@ def MAE_score(groundtruth_loader, trainers, gt_dataset, dim=3):
         # Truncate original to match predicted length
         # original = np.stack(all_motion, axis=0)
         # print(original.shape)
-        original = recover_from_ric(torch.from_numpy(original).float(), 22).numpy()
+        if opt.dataset_name in ['t2m', 'kit']:
+            original = recover_from_ric(torch.from_numpy(original).float(), opt.joints_num).numpy()
         print(original.shape) 
         # num_frames, num_joints, dim = predicted.shape[1], predicted.shape[2], predicted.shape[3]
         assert not np.isnan(predicted).any(), "NaN values detected in predicted array"
         assert not np.isnan(original).any(), "NaN values detected in original array"
 
-        # MAE calculation
-        mae = np.mean(np.abs(predicted - original), axis=(1, 2, 3))
+        # MAE calculation: support both (N,T,D) and (N,T,J,3)
+        reduce_axes_np = tuple(range(1, predicted.ndim))
+        mae = np.mean(np.abs(predicted - original), axis=reduce_axes_np)
 
         # Velocity calculation (first derivative)
         # velocity_original = np.gradient(original, axis=1)  # Gradient along time
@@ -119,20 +180,22 @@ def MAE_score(groundtruth_loader, trainers, gt_dataset, dim=3):
         # jerk_original = np.gradient(np.gradient(np.gradient(original, axis=1), axis=1), axis=1)
         # jerk_predicted = np.gradient(np.gradient(np.gradient(predicted, axis=1), axis=1), axis=1)
         # jerk_error = np.mean(np.abs(jerk_original - jerk_predicted), axis=(0, 1, 2))
-        velocity_predicted = torch.diff(predicted, dim=1)  # Shape: [batch_size, 195, 22, 3]
-        velocity_original = torch.diff(original, dim=1)
+        velocity_predicted = torch.diff(torch.from_numpy(predicted), dim=1)
+        velocity_original = torch.diff(torch.from_numpy(original), dim=1)
 
         # Calculate Velocity Error (MAE between velocity_predicted and velocity_original)
-        velocity_error = torch.mean(torch.abs(velocity_predicted - velocity_original), dim=(1, 2, 3))
+        reduce_axes_t = tuple(range(1, velocity_predicted.ndim))
+        velocity_error = torch.mean(torch.abs(velocity_predicted - velocity_original), dim=reduce_axes_t)
         velocity_error = torch.mean(velocity_error)  # Averaging over the batch
 
         # Jerk Calculation (Third Derivative)
         # Apply diff three times to get the third derivative
-        jerk_predicted = torch.diff(velocity_predicted, dim=1)  # Shape: [batch_size, 194, 22, 3]
+        jerk_predicted = torch.diff(velocity_predicted, dim=1)
         jerk_original = torch.diff(velocity_original, dim=1)
 
         # Calculate Jerk Error (MAE between jerk_predicted and jerk_original)
-        jerk_error = torch.mean(torch.abs(jerk_predicted - jerk_original), dim=(1, 2, 3))
+        reduce_axes_j = tuple(range(1, jerk_predicted.ndim))
+        jerk_error = torch.mean(torch.abs(jerk_predicted - jerk_original), dim=reduce_axes_j)
         jerk_error = torch.mean(jerk_error)  # Averaging over the batch
 
     # mae, velocity_error, and jerk_error now contain the respective metrics for each joint
@@ -213,7 +276,7 @@ def MAE_score(groundtruth_loader, trainers, gt_dataset, dim=3):
 #                 diffs[i, j] = np.linalg.norm(orig_joint - pred_joint)
 
 #         return np.mean(diffs, axis=0)
-def PAE_score(groundtruth_loader, trainers, gt_dataset, dim=3, mm_num_samples=100, mm_num_repeats=10):
+def PAE_score(groundtruth_loader, trainers, gt_dataset, mean, std, dim=3, mm_num_samples=100, mm_num_repeats=10):
     """Compute Position Average Error (PAE) for each joint
 
     Args:
@@ -226,12 +289,10 @@ def PAE_score(groundtruth_loader, trainers, gt_dataset, dim=3, mm_num_samples=10
         np.ndarray: PAE between original and predicted for each joint
     """
     dataloader = DataLoader(gt_dataset, batch_size=1, num_workers=1, shuffle=True)
-    epoch, it = trainers.load('/home/ltdoanh/jupyter/jupyter/ldtan/MotionDiffuse/t2m/t2m_new_ver2/model/ckpt_e030.tar')
-    mean = np.load('/home/ltdoanh/jupyter/jupyter/ldtan/MotionDiffuse/t2m/t2m_new_ver2/meta/mean.npy')
-    std = np.load('/home/ltdoanh/jupyter/jupyter/ldtan/MotionDiffuse/t2m/t2m_new_ver2/meta/std.npy')
     trainers.eval_mode()
     trainers.to(opt.device)
     mm_generated_motions = []
+    mm_num_samples = min(mm_num_samples, len(gt_dataset))
     mm_idxs = np.random.choice(len(gt_dataset), mm_num_samples, replace=False)
     mm_idxs = np.sort(mm_idxs)
     all_caption = []
@@ -246,8 +307,8 @@ def PAE_score(groundtruth_loader, trainers, gt_dataset, dim=3, mm_num_samples=10
             mm_num_now = len(mm_generated_motions)
             is_mm = (mm_num_now < mm_num_samples) and (i == mm_idxs[mm_num_now])
             repeat_times = mm_num_repeats if is_mm else 1
-            m_lens = max(m_lens // opt.unit_length * opt.unit_length, min_mov_length * opt.unit_length)
-            m_lens = min(m_lens, opt.max_motion_length)
+            m_lens = (m_lens // opt.unit_length) * opt.unit_length
+            m_lens = torch.clamp(m_lens, min=min_mov_length * opt.unit_length, max=opt.max_motion_length)
             if isinstance(m_lens, int):
                 m_lens = torch.LongTensor([m_lens]).to(opt.device)
             else:
@@ -265,15 +326,16 @@ def PAE_score(groundtruth_loader, trainers, gt_dataset, dim=3, mm_num_samples=10
     # Generate all sequences
     with torch.no_grad():
         predicted = trainers.generate(all_caption, all_m_lens, opt.dim_pose)
-        predicted = torch.stack(predicted , dim=0).cpu().numpy()
+        predicted = torch.stack(predicted, dim=0).cpu().numpy()
         predicted = predicted * std + mean
-        # Recover the predicted positions
-        predicted = recover_from_ric(torch.from_numpy(predicted).float(), opt.joints_num).numpy()
+        if opt.dataset_name in ['t2m', 'kit']:
+            predicted = recover_from_ric(torch.from_numpy(predicted).float(), opt.joints_num).numpy()
         
         # Concatenate all ground truth motions and recover them
         original = np.concatenate(all_motion, axis=0)
         original = original * std + mean
-        original = recover_from_ric(torch.from_numpy(original).float(), opt.joints_num).numpy()
+        if opt.dataset_name in ['t2m', 'kit']:
+            original = recover_from_ric(torch.from_numpy(original).float(), opt.joints_num).numpy()
 
         # Get the shapes for joint-wise error computation
         # num_frames = predicted.shape[1]  # Number of time steps (196)
@@ -287,7 +349,10 @@ def PAE_score(groundtruth_loader, trainers, gt_dataset, dim=3, mm_num_samples=10
         #     distance = np.linalg.norm(original[:, :, i, :] - predicted[:, :, i, :], axis=-1)
         #     # Compute the mean distance across all frames and samples for this joint
         #     pae[i] = np.mean(distance)
-        pae = torch.mean(torch.abs(predicted - original), dim=(1, 2, 3))  # Mean over time, joints, and coordinates
+        pred_t = torch.from_numpy(predicted)
+        orig_t = torch.from_numpy(original)
+        reduce_axes = tuple(range(1, pred_t.ndim))
+        pae = torch.mean(torch.abs(pred_t - orig_t), dim=reduce_axes)
         pae = torch.mean(pae)
 
     # pae now contains the PAE for each joint
@@ -481,27 +546,7 @@ def get_metric_statistics(values):
     return mean, conf_interval
 
 
-def evaluation(eval_wrapper, 
-               gt_loader, 
-               eval_motion_loaders, 
-               log_file, replication_times, 
-               distortion_scale, diversity_scale, 
-               mmm_scale, r_precision_batch,
-               atching_score_batch, window_size, 
-               batch_size_eval
-            ):
-    # === FIX: THÊM CÁC DÒNG NÀY VÀO ĐẦU HÀM ===
-    # Khai báo các giá trị mặc định bị thiếu
-    replication_times = 1      # Số lần lặp lại đánh giá (để 1 cho nhanh, 20 cho chuẩn)
-    batch_size_eval = 32       # Batch size
-    matching_score_batch = 32
-    r_precision_batch = 32
-    window_size = 20           # Cửa sổ đánh giá (BEAT/HumanML3D dùng 20)
-    
-    # Các hệ số scale (giữ mặc định là 1.0)
-    distortion_scale = 1.0
-    diversity_scale = 1.0
-    mmm_scale = 1.0
+def evaluation(eval_wrapper, gt_loader, eval_motion_loaders, log_file, replication_times=1):
     with open(log_file, 'w') as f:
         all_metrics = OrderedDict({'Matching Score': OrderedDict({}),
                                    'R_precision': OrderedDict({}),
@@ -590,65 +635,91 @@ def evaluation(eval_wrapper,
 
 
 if __name__ == '__main__':
-    mm_num_samples = 100
-    mm_num_repeats = 30
-    mm_num_times = 10
-    diversity_times = 300
-    replication_times = 20
-    batch_size = 512
-    opt_path = sys.argv[1]
-    # opt_path = '/home/ltdoanh/jupyter/jupyter/ldtan/HumanML3D/HumanML3D/test.txt
-    dataset_opt_path = opt_path
-    # dataset_opt_path ='/home/ltdoanh/jupyter/jupyter/ldtan/HumanML3D/HumanML3D/test.txt'
+    if len(sys.argv) < 2:
+        raise SystemExit("Usage: python tools/evaluation.py <opt.txt>")
 
-    # try:
-    #     device_id = int(sys.argv[2])
-    # except:
-    #     device_id = 0
-    device_id = 0
-    device = torch.device('cuda:%d' % device_id if torch.cuda.is_available() else 'cpu')
-    torch.cuda.set_device(device_id)
-    print('doanh')
-    gt_loader, gt_dataset = get_dataset_motion_loader(dataset_opt_path, batch_size, device)
-    
-    wrapper_opt = get_opt(dataset_opt_path, device)
-    eval_wrapper = EvaluatorModelWrapper(wrapper_opt)
+    mm_num_samples = 20 # 100
+    mm_num_repeats = 2 # 30
+    mm_num_times = 8 # 10
+    diversity_times = 300
+    replication_times = 1
+    batch_size = 64
+
+    opt_path = sys.argv[1]
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if device.type == 'cuda':
+        torch.cuda.set_device(0)
 
     opt = get_opt(opt_path, device)
+    _setup_dataset(opt)
+
+    ckpt_path = _resolve_checkpoint(opt)
+    print(f"[INFO] Using checkpoint: {ckpt_path}")
+
+    mean = np.load(pjoin(opt.meta_dir, 'mean.npy'))
+    std = np.load(pjoin(opt.meta_dir, 'std.npy'))
+
+    gt_loader, gt_dataset = get_dataset_motion_loader(opt_path, batch_size, device)
+
+    run_text_metrics = opt.dataset_name in ['t2m', 'kit']
+    eval_wrapper = None
+    if run_text_metrics:
+        wrapper_opt = get_opt(opt_path, device)
+        _setup_dataset(wrapper_opt)
+        if not hasattr(wrapper_opt, 'evaluator_path'):
+            wrapper_opt.evaluator_path = pjoin(ROOT, 'checkpoints', 't2m', 'text_mot_match', 'model', 'finest.tar')
+        if not os.path.exists(wrapper_opt.evaluator_path):
+            raise FileNotFoundError(f"Evaluator checkpoint not found: {wrapper_opt.evaluator_path}")
+        eval_wrapper = EvaluatorModelWrapper(wrapper_opt)
+
     encoder = build_models(opt, opt.dim_pose)
     trainer = DDPMTrainer(opt, encoder)
-    
-    
-    with open('/home/ltdoanh/jupyter/jupyter/ldtan/MotionDiffuse/text2motion/output.txt', 'a') as f:
+    trainer.load(ckpt_path)
+
+    log_path = pjoin(opt.save_root, 'evaluation_metrics.txt')
+    with open(log_path, 'a') as f:
         print("BEGIN_____________________________________________________BEGIN", file=f)
-        print("_____________________________________________________________", file=f)
         print("MAE score", file=f)
-        mae , velocity_error, jerk_error = MAE_score(gt_loader, trainer, gt_dataset, dim =3)
-        print(mae, file=f)
-        print("_____________________________________________________________", file=f)
-        print("velocity_error ", file=f)
-        print(velocity_error, file=f)
-        print("_____________________________________________________________", file=f)
-        print("jerk_error", file=f)
-        print( jerk_error , file=f)
-        print("_____________________________________________________________", file=f)
-        print("PAE score", file=f)
-        print(PAE_score(gt_loader, trainer, gt_dataset, dim =3), file=f)
-        print("END_____________________________________________________END", file=f)
-    eval_motion_loaders = {
-        'text2motion': lambda: get_motion_loader(
-            opt,
-            batch_size,
-            trainer,
-            gt_dataset,
-            mm_num_samples,
-            mm_num_repeats
+        mae, velocity_error, jerk_error = MAE_score(
+            gt_loader, trainer, gt_dataset, mean, std, dim=3,
+            mm_num_samples=mm_num_samples, mm_num_repeats=mm_num_repeats
         )
-    }
-    
-    log_file = '/home/ltdoanh/jupyter/jupyter/ldtan/MotionDiffuse/t2m_evaluation.log'
-    evaluation(log_file)
-    
-    print(MAE_score(gt_loader, trainer, gt_dataset, dim =3))
-    print(PAE_score(gt_loader, trainer, gt_dataset, dim =3))
-    
+        print(mae, file=f)
+        print("velocity_error", file=f)
+        print(velocity_error, file=f)
+        print("jerk_error", file=f)
+        print(jerk_error, file=f)
+        print("PAE score", file=f)
+        print(PAE_score(
+            gt_loader, trainer, gt_dataset, mean, std, dim=3,
+            mm_num_samples=mm_num_samples, mm_num_repeats=mm_num_repeats
+        ), file=f)
+        print("END_____________________________________________________END", file=f)
+
+    if run_text_metrics:
+        eval_motion_loaders = {
+            'text2motion': lambda: get_motion_loader(
+                opt,
+                batch_size,
+                trainer,
+                gt_dataset,
+                mm_num_samples,
+                mm_num_repeats
+            )
+        }
+
+        log_file = pjoin(opt.save_root, 'evaluation_log.txt')
+        evaluation(eval_wrapper, gt_loader, eval_motion_loaders, log_file, replication_times=replication_times)
+    else:
+        print("[WARN] Skipping Matching/FID/Diversity/Multimodality for BEAT. "
+              "Evaluator model is trained on HumanML3D (263 dims) and is not compatible with BEAT (264 dims).")
+
+    print(MAE_score(
+        gt_loader, trainer, gt_dataset, mean, std, dim=3,
+        mm_num_samples=mm_num_samples, mm_num_repeats=mm_num_repeats
+    ))
+    print(PAE_score(
+        gt_loader, trainer, gt_dataset, mean, std, dim=3,
+        mm_num_samples=mm_num_samples, mm_num_repeats=mm_num_repeats
+    ))
