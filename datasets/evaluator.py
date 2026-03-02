@@ -482,15 +482,17 @@ class EvaluatorModelWrapper(object):
 
         if opt.dataset_name == 't2m':
             opt.dim_pose = 263
+            opt.max_motion_length = 196
         elif opt.dataset_name == 'kit':
             opt.dim_pose = 251
+            opt.max_motion_length = 196
         elif opt.dataset_name == 'beat':
-            opt.dim_pose = 263
+            opt.dim_pose = getattr(opt, 'dim_pose', 264)
+            opt.max_motion_length = getattr(opt, 'max_motion_length', 360)
         else:
             raise KeyError('Dataset not Recognized!!!')
 
         opt.dim_word = 300
-        opt.max_motion_length = 196
         opt.dim_pos_ohot = len(POS_enumerator)
         opt.dim_motion_hidden = 1024
         opt.max_text_len = 20

@@ -662,16 +662,22 @@ if __name__ == '__main__':
 
     gt_loader, gt_dataset = get_dataset_motion_loader(opt_path, batch_size, device)
 
-    run_text_metrics = opt.dataset_name in ['t2m', 'kit']
+    run_text_metrics = False
     eval_wrapper = None
-    if run_text_metrics:
-        wrapper_opt = get_opt(opt_path, device)
-        _setup_dataset(wrapper_opt)
-        if not hasattr(wrapper_opt, 'evaluator_path'):
+    wrapper_opt = get_opt(opt_path, device)
+    _setup_dataset(wrapper_opt)
+    if not hasattr(wrapper_opt, 'evaluator_path'):
+        if wrapper_opt.dataset_name == 'beat':
+            wrapper_opt.evaluator_path = pjoin(ROOT, 'checkpoints', 'beat', 'text_mot_match', 'model', 'finest.tar')
+        else:
             wrapper_opt.evaluator_path = pjoin(ROOT, 'checkpoints', 't2m', 'text_mot_match', 'model', 'finest.tar')
-        if not os.path.exists(wrapper_opt.evaluator_path):
-            raise FileNotFoundError(f"Evaluator checkpoint not found: {wrapper_opt.evaluator_path}")
+    if os.path.exists(wrapper_opt.evaluator_path):
+        run_text_metrics = True
         eval_wrapper = EvaluatorModelWrapper(wrapper_opt)
+    elif opt.dataset_name in ['t2m', 'kit']:
+        raise FileNotFoundError(f"Evaluator checkpoint not found: {wrapper_opt.evaluator_path}")
+    else:
+        print(f"[WARN] Evaluator checkpoint not found for {opt.dataset_name}: {wrapper_opt.evaluator_path}")
 
     encoder = build_models(opt, opt.dim_pose)
     trainer = DDPMTrainer(opt, encoder)
@@ -712,8 +718,8 @@ if __name__ == '__main__':
         log_file = pjoin(opt.save_root, 'evaluation_log.txt')
         evaluation(eval_wrapper, gt_loader, eval_motion_loaders, log_file, replication_times=replication_times)
     else:
-        print("[WARN] Skipping Matching/FID/Diversity/Multimodality for BEAT. "
-              "Evaluator model is trained on HumanML3D (263 dims) and is not compatible with BEAT (264 dims).")
+        print(f"[WARN] Skipping Matching/FID/Diversity/Multimodality for {opt.dataset_name}. "
+              "Train or provide a compatible evaluator checkpoint and set evaluator_path.")
 
     print(MAE_score(
         gt_loader, trainer, gt_dataset, mean, std, dim=3,

@@ -466,6 +466,15 @@ class GaussianDiffusion:
             
             # Base MSE loss in latent space
             loss_latent = mean_flat((target - model_output) ** 2)
+            # Also expose predicted clean sample x0 for auxiliary motion-space losses.
+            if self.model_mean_type == ModelMeanType.EPSILON:
+                pred_xstart = self._predict_xstart_from_eps(x_t=x_t, t=t, eps=model_output)
+            elif self.model_mean_type == ModelMeanType.START_X:
+                pred_xstart = model_output
+            elif self.model_mean_type == ModelMeanType.VELOCITY:
+                pred_xstart = self._predict_xstart_from_v(x_t=x_t, t=t, v=model_output)
+            else:  # PREVIOUS_X
+                pred_xstart = self._predict_xstart_from_xprev(x_t=x_t, t=t, xprev=model_output)
             
             # Check if hand/body loss should be computed
             if (self.vq_model is not None and 
@@ -475,16 +484,7 @@ class GaussianDiffusion:
                 'raw_motion' in model_kwargs['y']):
                 
                 # Predict clean latent (x_0) from model output
-                if self.model_mean_type == ModelMeanType.EPSILON:
-                    pred_latent = self._predict_xstart_from_eps(x_t=x_t, t=t, eps=model_output)
-                elif self.model_mean_type == ModelMeanType.START_X:
-                    pred_latent = model_output
-                # --- THÊM KHỐI NÀY ---
-                elif self.model_mean_type == ModelMeanType.VELOCITY:
-                    pred_latent = self._predict_xstart_from_v(x_t=x_t, t=t, v=model_output)
-                # ---------------------
-                else:  # PREVIOUS_X
-                    pred_latent = self._predict_xstart_from_xprev(x_t=x_t, t=t, xprev=model_output)
+                pred_latent = pred_xstart
                 
                 # Decode to motion space
                 pred_motion = self.vq_model.decode_from_latent(latent=pred_latent)
@@ -519,6 +519,7 @@ class GaussianDiffusion:
             terms["mse"] = loss_latent
             terms["target"] = target
             terms["pred"] = model_output
+            terms["pred_xstart"] = pred_xstart
         
         elif self.loss_type == LossType.L1 or self.loss_type == LossType.RESCALED_L1:
             model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
@@ -561,6 +562,14 @@ class GaussianDiffusion:
             
             # Base L1 loss in latent space
             loss_latent = mean_flat((target - model_output).abs())
+            if self.model_mean_type == ModelMeanType.EPSILON:
+                pred_xstart = self._predict_xstart_from_eps(x_t=x_t, t=t, eps=model_output)
+            elif self.model_mean_type == ModelMeanType.START_X:
+                pred_xstart = model_output
+            elif self.model_mean_type == ModelMeanType.VELOCITY:
+                pred_xstart = self._predict_xstart_from_v(x_t=x_t, t=t, v=model_output)
+            else:  # PREVIOUS_X
+                pred_xstart = self._predict_xstart_from_xprev(x_t=x_t, t=t, xprev=model_output)
             
             # Check if hand/body loss should be computed
             if (self.vq_model is not None and 
@@ -570,12 +579,7 @@ class GaussianDiffusion:
                 'raw_motion' in model_kwargs['y']):
                 
                 # Predict clean latent
-                if self.model_mean_type == ModelMeanType.EPSILON:
-                    pred_latent = self._predict_xstart_from_eps(x_t=x_t, t=t, eps=model_output)
-                elif self.model_mean_type == ModelMeanType.START_X:
-                    pred_latent = model_output
-                else:  # PREVIOUS_X
-                    pred_latent = self._predict_xstart_from_xprev(x_t=x_t, t=t, xprev=model_output)
+                pred_latent = pred_xstart
                 
                 # Decode to motion space
                 pred_motion = self.vq_model.decode_from_latent(latent=pred_latent)
@@ -608,6 +612,7 @@ class GaussianDiffusion:
             terms["l1"] = loss_latent
             terms["target"] = target
             terms["pred"] = model_output
+            terms["pred_xstart"] = pred_xstart
             
         else:
             raise NotImplementedError(self.loss_type)
@@ -1400,4 +1405,3 @@ def _extract_into_tensor(arr, timesteps, broadcast_shape):
     while len(res.shape) < len(broadcast_shape):
         res = res[..., None]
     return res.expand(broadcast_shape)
-

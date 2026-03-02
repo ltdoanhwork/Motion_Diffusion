@@ -14,7 +14,12 @@ import codecs as cs
 import torch.distributed as dist
 from tqdm import tqdm
 import copy
-from torch.cuda.amp import autocast, GradScaler
+try:
+    from torch.amp import autocast, GradScaler  # PyTorch >= 2.x preferred API
+    _USE_TORCH_AMP = True
+except ImportError:  # pragma: no cover - fallback for older torch
+    from torch.cuda.amp import autocast, GradScaler
+    _USE_TORCH_AMP = False
 
 # from mmcv.runner import get_dist_info
 from models.gaussian_diffusion import (
@@ -27,6 +32,8 @@ from models.gaussian_diffusion import (
 )
 
 from datasets import build_dataloader
+from datasets.emage_utils.rotation_conversions import axis_angle_to_rotation_6d, rotation_6d_to_matrix
+import utils.paramUtil as paramUtil
 
 
 class DDPMTrainer(object):
@@ -68,97 +75,7 @@ class DDPMTrainer(object):
         Hàm này chuẩn bị sẵn toàn bộ dữ liệu xương khớp lên GPU (self.device).
         Sau này khi train, model chỉ việc lấy ra dùng, không cần tạo lại.
         """
-        # 1. DANH SÁCH BONE PAIRS (Dùng cho Geometric Loss)
-        # Copy nguyên list bone_pairs dài ngoằng vào đây
-        raw_bone_pairs = [
-            (0, 1),  # Hips -> Spine
-            (1, 2),  # Spine -> Spine1
-            (2, 3),  # Spine1 -> Spine2
-            (3, 4),  # Spine2 -> Spine3
-            (4, 5),  # Spine3 -> Neck
-            (5, 6),  # Neck -> Neck1
-            (6, 7),  # Neck1 -> Head
-            (7, 8),  # Head -> HeadEnd
-            (8, 9),  # HeadEnd -> HeadEnd_Nub
-            (4, 10),  # Spine3 -> RightShoulder
-            (10, 11),  # RightShoulder -> RightArm
-            (11, 12),  # RightArm -> RightForeArm
-            (12, 13),  # RightForeArm -> RightHand
-            (13, 14),  # RightHand -> RightHandMiddle1
-            (14, 15),  # RightHandMiddle1 -> RightHandMiddle2
-            (15, 16),  # RightHandMiddle2 -> RightHandMiddle3
-            (16, 17),  # RightHandMiddle3 -> RightHandMiddle4
-            (17, 18),  # RightHandMiddle4 -> RightHandMiddle4_Nub
-            (13, 19),  # RightHand -> RightHandRing
-            (19, 20),  # RightHandRing -> RightHandRing1
-            (20, 21),  # RightHandRing1 -> RightHandRing2
-            (21, 22),  # RightHandRing2 -> RightHandRing3
-            (22, 23),  # RightHandRing3 -> RightHandRing4
-            (23, 24),  # RightHandRing4 -> RightHandRing4_Nub
-            (19, 25),  # RightHandRing -> RightHandPinky
-            (25, 26),  # RightHandPinky -> RightHandPinky1
-            (26, 27),  # RightHandPinky1 -> RightHandPinky2
-            (27, 28),  # RightHandPinky2 -> RightHandPinky3
-            (28, 29),  # RightHandPinky3 -> RightHandPinky4
-            (29, 30),  # RightHandPinky4 -> RightHandPinky4_Nub
-            (13, 31),  # RightHand -> RightHandIndex
-            (31, 32),  # RightHandIndex -> RightHandIndex1
-            (32, 33),  # RightHandIndex1 -> RightHandIndex2
-            (33, 34),  # RightHandIndex2 -> RightHandIndex3
-            (34, 35),  # RightHandIndex3 -> RightHandIndex4
-            (35, 36),  # RightHandIndex4 -> RightHandIndex4_Nub
-            (31, 37),  # RightHandIndex -> RightHandThumb1
-            (37, 38),  # RightHandThumb1 -> RightHandThumb2
-            (38, 39),  # RightHandThumb2 -> RightHandThumb3
-            (39, 40),  # RightHandThumb3 -> RightHandThumb4
-            (40, 41),  # RightHandThumb4 -> RightHandThumb4_Nub
-            (4, 42),  # Spine3 -> LeftShoulder
-            (42, 43),  # LeftShoulder -> LeftArm
-            (43, 44),  # LeftArm -> LeftForeArm
-            (44, 45),  # LeftForeArm -> LeftHand
-            (45, 46),  # LeftHand -> LeftHandMiddle1
-            (46, 47),  # LeftHandMiddle1 -> LeftHandMiddle2
-            (47, 48),  # LeftHandMiddle2 -> LeftHandMiddle3
-            (48, 49),  # LeftHandMiddle3 -> LeftHandMiddle4
-            (49, 50),  # LeftHandMiddle4 -> LeftHandMiddle4_Nub
-            (45, 51),  # LeftHand -> LeftHandRing
-            (51, 52),  # LeftHandRing -> LeftHandRing1
-            (52, 53),  # LeftHandRing1 -> LeftHandRing2
-            (53, 54),  # LeftHandRing2 -> LeftHandRing3
-            (54, 55),  # LeftHandRing3 -> LeftHandRing4
-            (55, 56),  # LeftHandRing4 -> LeftHandRing4_Nub
-            (51, 57),  # LeftHandRing -> LeftHandPinky
-            (57, 58),  # LeftHandPinky -> LeftHandPinky1
-            (58, 59),  # LeftHandPinky1 -> LeftHandPinky2
-            (59, 60),  # LeftHandPinky2 -> LeftHandPinky3
-            (60, 61),  # LeftHandPinky3 -> LeftHandPinky4
-            (61, 62),  # LeftHandPinky4 -> LeftHandPinky4_Nub
-            (45, 63),  # LeftHand -> LeftHandIndex
-            (63, 64),  # LeftHandIndex -> LeftHandIndex1
-            (64, 65),  # LeftHandIndex1 -> LeftHandIndex2
-            (65, 66),  # LeftHandIndex2 -> LeftHandIndex3
-            (66, 67),  # LeftHandIndex3 -> LeftHandIndex4
-            (67, 68),  # LeftHandIndex4 -> LeftHandIndex4_Nub
-            (63, 69),  # LeftHandIndex -> LeftHandThumb1
-            (69, 70),  # LeftHandThumb1 -> LeftHandThumb2
-            (70, 71),  # LeftHandThumb2 -> LeftHandThumb3
-            (71, 72),  # LeftHandThumb3 -> LeftHandThumb4
-            (72, 73),  # LeftHandThumb4 -> LeftHandThumb4_Nub
-            (0, 74),  # Hips -> RightUpLeg
-            (74, 75),  # RightUpLeg -> RightLeg
-            (75, 76),  # RightLeg -> RightFoot
-            (76, 77),  # RightFoot -> RightForeFoot
-            (77, 78),  # RightForeFoot -> RightToeBase
-            (78, 79),  # RightToeBase -> RightToeBaseEnd
-            (79, 80),  # RightToeBaseEnd -> RightToeBaseEnd_Nub
-            (0, 81),  # Hips -> LeftUpLeg
-            (81, 82),  # LeftUpLeg -> LeftLeg
-            (82, 83),  # LeftLeg -> LeftFoot
-            (83, 84),  # LeftFoot -> LeftForeFoot
-            (84, 85),  # LeftForeFoot -> LeftToeBase
-            (85, 86),  # LeftToeBase -> LeftToeBaseEnd
-            (86, 87),  # LeftToeBaseEnd -> LeftToeBaseEnd_Nub
-        ]
+        raw_bone_pairs = paramUtil.beat_bone_pairs
 
         # Tối ưu: Tách thành 2 Tensor Parent và Child đưa lên GPU ngay lập tức
         parents = [p for p, c in raw_bone_pairs]
@@ -168,97 +85,7 @@ class DDPMTrainer(object):
         self.bone_parent_indices = torch.LongTensor(parents).to(self.device)
         self.bone_child_indices = torch.LongTensor(children).to(self.device)
 
-        # 2. SKELETON TREE (Dùng cho Forward Kinematics)
-        # Copy nguyên list skeleton_tree dài ngoằng vào đây
-        raw_skeleton_tree = [
-            (0, 1, [0.0, 6.269896, -2.264934]),  # Hips -> Spine
-            (1, 2, [0.0, 12.478628, -2.20032]),  # Spine -> Spine1
-            (2, 3, [0.0, 12.622911, -1.104362]),  # Spine1 -> Spine2
-            (3, 4, [0.0, 12.671129, 0.0]),  # Spine2 -> Spine3
-            (4, 5, [0.0, 16.291454, 1.629145]),  # Spine3 -> Neck
-            (5, 6, [0.0, 3.456791, 0.30243]),  # Neck -> Neck1
-            (6, 7, [0.0, 3.417274, 0.602559]),  # Neck1 -> Head
-            (7, 8, [0.0, 9.72773, -0.0]),  # Head -> HeadEnd
-            (8, 9, [0.0, 9.727722, -0.0]),  # HeadEnd -> HeadEnd_Nub
-            (4, 10, [0.0, 11.636753, 5.87917]),  # Spine3 -> RightShoulder
-            (10, 11, [-19.553394, 8e-06, 0.0]),  # RightShoulder -> RightArm
-            (11, 12, [-30.623638, 1.1e-05, 0.0]),  # RightArm -> RightForeArm
-            (12, 13, [-25.458359, 8e-06, 0.0]),  # RightForeArm -> RightHand
-            (13, 14, [-9.328308, 4e-06, 0.0]),  # RightHand -> RightHandMiddle1
-            (14, 15, [-4.931488, 0.0, 0.0]),  # RightHandMiddle1 -> RightHandMiddle2
-            (15, 16, [-3.177132, 0.0, 0.0]),  # RightHandMiddle2 -> RightHandMiddle3
-            (16, 17, [-1.92765, 0.0, 0.0]),  # RightHandMiddle3 -> RightHandMiddle4
-            (17, 18, [-1.927643, 0.0, 0.0]),  # RightHandMiddle4 -> RightHandMiddle4_Nub
-            (13, 19, [-0.25, -0.25, -0.855603]),  # RightHand -> RightHandRing
-            (19, 20, [-8.228668, 4e-06, -0.742586]),  # RightHandRing -> RightHandRing1
-            (20, 21, [-4.579102, 0.0, -0.413236]),  # RightHandRing1 -> RightHandRing2
-            (21, 22, [-3.089668, 0.0, -0.278823]),  # RightHandRing2 -> RightHandRing3
-            (22, 23, [-1.908813, 0.0, -0.172259]),  # RightHandRing3 -> RightHandRing4
-            (23, 24, [-1.908813, 0.0, -0.172258]),  # RightHandRing4 -> RightHandRing4_Nub
-            (19, 25, [-0.172089, -0.25, -0.87461]),  # RightHandRing -> RightHandPinky
-            (25, 26, [-6.812508, 4e-06, -1.523409]),  # RightHandPinky -> RightHandPinky1
-            (26, 27, [-3.617294, 0.0, -0.808899]),  # RightHandPinky1 -> RightHandPinky2
-            (27, 28, [-2.311783, 0.0, -0.516959]),  # RightHandPinky2 -> RightHandPinky3
-            (28, 29, [-1.725502, 0.0, -0.385855]),  # RightHandPinky3 -> RightHandPinky4
-            (29, 30, [-1.725502, 0.0, -0.385856]),  # RightHandPinky4 -> RightHandPinky4_Nub
-            (13, 31, [-0.25, -0.25, 0.855603]),  # RightHand -> RightHandIndex
-            (31, 32, [-9.013367, 4e-06, 0.8134]),  # RightHandIndex -> RightHandIndex1
-            (32, 33, [-4.737785, 0.0, 0.427556]),  # RightHandIndex1 -> RightHandIndex2
-            (33, 34, [-2.835075, 0.0, 0.255847]),  # RightHandIndex2 -> RightHandIndex3
-            (34, 35, [-1.745514, 0.0, 0.157522]),  # RightHandIndex3 -> RightHandIndex4
-            (35, 36, [-1.745514, 0.0, 0.157522]),  # RightHandIndex4 -> RightHandIndex4_Nub
-            (31, 37, [-0.172089, -0.75, 0.87461]),  # RightHandIndex -> RightHandThumb1
-            (37, 38, [-5.4757, 0.845421, 2.271264]),  # RightHandThumb1 -> RightHandThumb2
-            (38, 39, [-3.582893, 0.553185, 1.486152]),  # RightHandThumb2 -> RightHandThumb3
-            (39, 40, [-2.19529, 0.338943, 0.910584]),  # RightHandThumb3 -> RightHandThumb4
-            (40, 41, [-2.19529, 0.338943, 0.910584]),  # RightHandThumb4 -> RightHandThumb4_Nub
-            (4, 42, [0.0, 11.636753, 5.87917]),  # Spine3 -> LeftShoulder
-            (42, 43, [19.553394, 8e-06, 0.0]),  # LeftShoulder -> LeftArm
-            (43, 44, [30.623638, 1.1e-05, 0.0]),  # LeftArm -> LeftForeArm
-            (44, 45, [25.458359, 8e-06, 0.0]),  # LeftForeArm -> LeftHand
-            (45, 46, [9.327454, 4e-06, 0.0]),  # LeftHand -> LeftHandMiddle1
-            (46, 47, [4.935944, 0.0, 0.0]),  # LeftHandMiddle1 -> LeftHandMiddle2
-            (47, 48, [3.187286, 0.0, 0.0]),  # LeftHandMiddle2 -> LeftHandMiddle3
-            (48, 49, [1.919037, 0.0, 0.0]),  # LeftHandMiddle3 -> LeftHandMiddle4
-            (49, 50, [1.919052, 0.0, 0.0]),  # LeftHandMiddle4 -> LeftHandMiddle4_Nub
-            (45, 51, [0.25, -0.25, -0.911864]),  # LeftHand -> LeftHandRing
-            (51, 52, [8.228249, 4e-06, -0.742548]),  # LeftHandRing -> LeftHandRing1
-            (52, 53, [4.570602, 0.0, -0.412469]),  # LeftHandRing1 -> LeftHandRing2
-            (53, 54, [3.097679, 0.0, -0.279546]),  # LeftHandRing2 -> LeftHandRing3
-            (54, 55, [1.900299, 0.0, -0.17149]),  # LeftHandRing3 -> LeftHandRing4
-            (55, 56, [1.900299, 0.0, -0.17149]),  # LeftHandRing4 -> LeftHandRing4_Nub
-            (51, 57, [0.16703, -0.25, -0.930643]),  # LeftHandRing -> LeftHandPinky
-            (57, 58, [6.794594, 4e-06, -1.519404]),  # LeftHandPinky -> LeftHandPinky1
-            (58, 59, [3.623344, 0.0, -0.810251]),  # LeftHandPinky1 -> LeftHandPinky2
-            (59, 60, [2.307434, 0.0, -0.515988]),  # LeftHandPinky2 -> LeftHandPinky3
-            (60, 61, [1.717804, 0.0, -0.384134]),  # LeftHandPinky3 -> LeftHandPinky4
-            (61, 62, [1.717804, 0.0, -0.384135]),  # LeftHandPinky4 -> LeftHandPinky4_Nub
-            (45, 63, [0.25, -0.25, 0.911864]),  # LeftHand -> LeftHandIndex
-            (63, 64, [8.99826, 4e-06, 0.812038]),  # LeftHandIndex -> LeftHandIndex1
-            (64, 65, [4.745354, 0.0, 0.428239]),  # LeftHandIndex1 -> LeftHandIndex2
-            (65, 66, [2.836342, 0.0, 0.255961]),  # LeftHandIndex2 -> LeftHandIndex3
-            (66, 67, [1.737732, 0.0, 0.15682]),  # LeftHandIndex3 -> LeftHandIndex4
-            (67, 68, [1.737732, 0.0, 0.156819]),  # LeftHandIndex4 -> LeftHandIndex4_Nub
-            (63, 69, [0.16703, -0.75, 0.930643]),  # LeftHandIndex -> LeftHandThumb1
-            (69, 70, [5.434509, 0.839062, 2.254179]),  # LeftHandThumb1 -> LeftHandThumb2
-            (70, 71, [3.593353, 0.554794, 1.490485]),  # LeftHandThumb2 -> LeftHandThumb3
-            (71, 72, [2.185493, 0.337429, 0.906521]),  # LeftHandThumb3 -> LeftHandThumb4
-            (72, 73, [2.185501, 0.337429, 0.906523]),  # LeftHandThumb4 -> LeftHandThumb4_Nub
-            (0, 74, [-8.246678, 0.0, 0.0]),  # Hips -> RightUpLeg
-            (74, 75, [0.0, -42.827576, 0.0]),  # RightUpLeg -> RightLeg
-            (75, 76, [0.0, -43.165855, 0.0]),  # RightLeg -> RightFoot
-            (76, 77, [0.0, -2.559708, 0.0]),  # RightFoot -> RightForeFoot
-            (77, 78, [0.0, 0.0, 10.024612]),  # RightForeFoot -> RightToeBase
-            (78, 79, [0.0, 0.0, 14.750254]),  # RightToeBase -> RightToeBaseEnd
-            (79, 80, [0.0, 0.0, 14.75025]),  # RightToeBaseEnd -> RightToeBaseEnd_Nub
-            (0, 81, [8.246678, 0.0, 0.0]),  # Hips -> LeftUpLeg
-            (81, 82, [0.0, -42.827576, 0.0]),  # LeftUpLeg -> LeftLeg
-            (82, 83, [0.0, -43.165855, 0.0]),  # LeftLeg -> LeftFoot
-            (83, 84, [0.0, -2.559708, 0.0]),  # LeftFoot -> LeftForeFoot
-            (84, 85, [0.0, 0.0, 10.024612]),  # LeftForeFoot -> LeftToeBase
-            (85, 86, [0.0, 0.0, 14.330561]),  # LeftToeBase -> LeftToeBaseEnd
-            (86, 87, [0.0, 0.0, 14.330564]),  # LeftToeBaseEnd -> LeftToeBaseEnd_Nub
-        ]
+        raw_skeleton_tree = paramUtil.beat_skeleton_tree
 
         # Tối ưu: Pre-process offset thành Tensor trên GPU
         # Tạo một list mới chứa (parent, child, offset_tensor_gpu)
@@ -310,6 +137,7 @@ class DDPMTrainer(object):
 
         self.real_noise = output['target']
         self.fake_noise = output['pred']
+        self.pred_xstart = output.get('pred_xstart', self.fake_noise)
         try:
             self.src_mask = self.encoder.module.generate_src_mask(T, cur_len).to(x_start.device)
         except:
@@ -396,8 +224,15 @@ class DDPMTrainer(object):
         return all_output
 
     def backward_G(self):
-        loss_mot_rec = self.mse_criterion(self.fake_noise, self.real_noise).mean(dim=-1)
-        loss_mot_rec = (loss_mot_rec * self.src_mask).sum() / self.src_mask.sum()
+        # Keep loss computation in FP32 to avoid Half/Float dtype mismatch in backward.
+        fake_noise = self.fake_noise.float()
+        real_noise = self.real_noise.float()
+        src_mask = self.src_mask.float()
+        pred_motion = self.pred_xstart.float()
+        gt_motion = self.motions.float()
+
+        loss_mot_rec = self.mse_criterion(fake_noise, real_noise).mean(dim=-1)
+        loss_mot_rec = (loss_mot_rec * src_mask).sum() / src_mask.sum()
         
         loss_vel = None
         loss_acc = None
@@ -405,28 +240,46 @@ class DDPMTrainer(object):
         
         # THÊM: Velocity Loss (giảm jitter)
         if self.opt.use_velocity_loss:
-            vel_gt = self.motions[:, 1:] - self.motions[:, :-1]
-            vel_pred = self.fake_noise[:, 1:] - self.fake_noise[:, :-1]
-            loss_vel = self.mse_criterion(vel_pred, vel_gt).mean()
+            vel_gt = gt_motion[:, 1:] - gt_motion[:, :-1]
+            vel_pred = pred_motion[:, 1:] - pred_motion[:, :-1]
+            vel_mask = (src_mask[:, 1:] * src_mask[:, :-1]).unsqueeze(-1)  # (B, T-1, 1)
+            vel_sq = self.mse_criterion(vel_pred, vel_gt) * vel_mask
+            denom_vel = vel_mask.sum() * vel_pred.shape[-1] + 1e-8
+            loss_vel = vel_sq.sum() / denom_vel
             loss_mot_rec = loss_mot_rec + self.opt.velocity_weight * loss_vel
         
         # THÊM: Acceleration Loss (motion smoother)
         if self.opt.use_acceleration_loss and loss_vel is not None:
             acc_gt = vel_gt[:, 1:] - vel_gt[:, :-1]
             acc_pred = vel_pred[:, 1:] - vel_pred[:, :-1]
-            loss_acc = self.mse_criterion(acc_pred, acc_gt).mean()
+            acc_mask = (vel_mask[:, 1:] * vel_mask[:, :-1])  # (B, T-2, 1)
+            acc_sq = self.mse_criterion(acc_pred, acc_gt) * acc_mask
+            denom_acc = acc_mask.sum() * acc_pred.shape[-1] + 1e-8
+            loss_acc = acc_sq.sum() / denom_acc
             loss_mot_rec = loss_mot_rec + self.opt.acceleration_weight * loss_acc
         
         # THÊM: Geometric Loss (Bone length consistency)
         if self.opt.use_geometric_loss:
-            # Giả sử motion là axis-angle format (T, 264) = (T, 55*3)
-            # Tính forward kinematics để lấy joint positions
-            loss_geom = self.compute_geometric_loss(
-                self.fake_noise, 
-                self.motions
-            )
+            # Geometric/FK path is numerically sensitive under FP16; force FP32.
+            if _USE_TORCH_AMP:
+                with autocast(device_type='cuda', enabled=False):
+                    loss_geom = self.compute_geometric_loss(
+                        pred_motion.float(),
+                        gt_motion.float(),
+                        src_mask=src_mask,
+                    )
+            else:
+                with autocast(enabled=False):
+                    loss_geom = self.compute_geometric_loss(
+                        pred_motion.float(),
+                        gt_motion.float(),
+                        src_mask=src_mask,
+                    )
             loss_mot_rec = loss_mot_rec + self.opt.geometric_weight * loss_geom
         
+        if not torch.isfinite(loss_mot_rec):
+            raise RuntimeError("Non-finite loss detected (nan/inf). Try lower aux loss weights or disable AMP.")
+
         self.loss_mot_rec = loss_mot_rec
         loss_logs = OrderedDict({
             'loss_mot_rec': self.loss_mot_rec.item()
@@ -441,15 +294,13 @@ class DDPMTrainer(object):
         
         return loss_logs
 
-    def compute_geometric_loss(self, motion_pred, motion_gt):
-        # 1. Import hàm chuyển đổi
-        import sys
-        sys.path.insert(0, './datasets')
-        from emage_utils.rotation_conversions import axis_angle_to_rotation_6d
-
+    def compute_geometric_loss(self, motion_pred, motion_gt, src_mask=None):
         # 2. Reshape về (B, T, J, 3) 
         # Model của bạn vẫn đang output Axis-Angle (3 channel) nên reshape về 3 là đúng
-        n_joints = 88 # Hãy đảm bảo số này khớp với dataset BEAT của bạn
+        feat_dim = motion_pred.shape[-1]
+        if feat_dim % 3 != 0:
+            raise ValueError(f"Expected axis-angle feature dim divisible by 3, got {feat_dim}")
+        n_joints = feat_dim // 3
         
         motion_pred_reshaped = motion_pred.reshape(motion_pred.shape[0], motion_pred.shape[1], n_joints, 3)
         motion_gt_reshaped = motion_gt.reshape(motion_gt.shape[0], motion_gt.shape[1], n_joints, 3)
@@ -462,11 +313,24 @@ class DDPMTrainer(object):
         positions_pred = self.forward_kinematics(motion_pred_6d, motion_raw=motion_pred) 
         positions_gt = self.forward_kinematics(motion_gt_6d, motion_raw=motion_gt)
 
+        if src_mask is None:
+            src_mask = torch.ones(
+                motion_pred.shape[0],
+                motion_pred.shape[1],
+                device=motion_pred.device,
+                dtype=motion_pred.dtype,
+            )
+        else:
+            src_mask = src_mask.to(device=motion_pred.device, dtype=motion_pred.dtype)
+        valid_frames = src_mask.sum() + 1e-8
+
         # --- FK LOSS (Global Position Loss) ---
-        fk_loss = None 
+        fk_loss = torch.tensor(0.0, device=motion_pred.device, dtype=motion_pred.dtype)
         if getattr(self.opt, 'use_fk_loss', False): 
-            # Tính MSE positions
-            fk_loss = torch.mean((positions_pred - positions_gt) ** 2)
+            # Tính MSE theo frame rồi mask các frame padding.
+            fk_sq = (positions_pred - positions_gt) ** 2
+            fk_per_frame = fk_sq.mean(dim=(-1, -2))
+            fk_loss = (fk_per_frame * src_mask).sum() / valid_frames
             fk_weight = getattr(self.opt, 'fk_weight', 1.0)
             fk_loss = fk_loss * fk_weight
 
@@ -487,10 +351,14 @@ class DDPMTrainer(object):
         # Loss 1: Direction (Cosine similarity)
         bone_pred_norm = bone_pred / bone_len_pred
         bone_gt_norm = bone_gt / bone_len_gt
-        dir_loss = (1 - (bone_pred_norm * bone_gt_norm).sum(dim=-1)).mean()
+        dir_per_bone = 1 - (bone_pred_norm * bone_gt_norm).sum(dim=-1)
+        dir_per_frame = dir_per_bone.mean(dim=-1)
+        dir_loss = (dir_per_frame * src_mask).sum() / valid_frames
         
         # Loss 2: Length consistency
-        len_loss = torch.abs(bone_len_pred - bone_len_gt).mean()
+        len_per_bone = torch.abs(bone_len_pred - bone_len_gt).squeeze(-1)
+        len_per_frame = len_per_bone.mean(dim=-1)
+        len_loss = (len_per_frame * src_mask).sum() / valid_frames
         
         return dir_loss + len_loss + fk_loss
 
@@ -544,12 +412,6 @@ class DDPMTrainer(object):
         Input: rot6d có shape (B, T, n_joints, 6)
         Output: positions có shape (B, T, n_joints, 3)
         """
-        import sys
-        sys.path.insert(0, './datasets')
-        
-        # 1. Thay đổi import
-        from emage_utils.rotation_conversions import rotation_6d_to_matrix
-        
         B, T, n_joints, dims = rot6d.shape
         
         # Kiểm tra nhanh: Nếu input là 6D thì dims phải bằng 6
@@ -559,36 +421,41 @@ class DDPMTrainer(object):
         # Input: (B, T, J, 6) -> Output: (B, T, J, 3, 3)
         local_rot_mats = rotation_6d_to_matrix(rot6d)
                 
-        # Tạo chỗ chứa Global Rotations và Positions
-        global_rot_mats = torch.zeros_like(local_rot_mats) 
-        positions = torch.zeros(B, T, n_joints, 3, device=rot6d.device)
-        
+        # NOTE: Avoid in-place writes on tensors that participate in autograd.
+        # Build FK results as python lists then stack once at the end.
+        global_rot_mats = [None] * n_joints
+        positions = [None] * n_joints
+
         # Root (Hips)
         if motion_raw is not None:
-            # Nếu có raw features, khôi phục vị trí thực tế
-            root_pos = self.recover_root_translation(motion_raw) # (B, T, 1, 3)
-            positions[:, :, 0] = root_pos.squeeze(2)
+            root_pos = self.recover_root_translation(motion_raw)  # (B, T, 1, 3)
+            positions[0] = root_pos.squeeze(2)
         else:
-            # Mặc định tại (0,0,0) nếu không có raw data
-            positions[:, :, 0] = 0
+            positions[0] = torch.zeros(B, T, 3, device=rot6d.device, dtype=rot6d.dtype)
 
-        global_rot_mats[:, :, 0] = local_rot_mats[:, :, 0]
-        
+        global_rot_mats[0] = local_rot_mats[:, :, 0]
+
         # Duyệt qua cây xương đã tối ưu (Parent -> Child)
         for parent, child, offset in self.optimized_skeleton_tree:
-            # Tính Global Rotation của Child: Parent_Global @ Child_Local
-            global_rot_mats[:, :, child] = torch.matmul(
-                global_rot_mats[:, :, parent], 
-                local_rot_mats[:, :, child]
-            )
-            
-            # Tính Position của Child: Pos_Parent + (Parent_Global @ Offset)
-            # Offset shape (1, 1, 3, 1) xoay theo hướng của Parent
-            rot_offset = torch.matmul(global_rot_mats[:, :, parent], offset).squeeze(-1)
-            
-            positions[:, :, child] = positions[:, :, parent] + rot_offset
-            
-        return positions
+            parent_rot = global_rot_mats[parent]
+            if parent_rot is None:
+                continue
+
+            # Global rotation của child
+            child_rot = torch.matmul(parent_rot, local_rot_mats[:, :, child])
+            # Position của child: parent_pos + parent_rot @ offset
+            rot_offset = torch.matmul(parent_rot, offset).squeeze(-1)
+            child_pos = positions[parent] + rot_offset
+
+            global_rot_mats[child] = child_rot
+            positions[child] = child_pos
+
+        # Fallback for any disconnected/unused joints
+        for j in range(n_joints):
+            if positions[j] is None:
+                positions[j] = positions[0]
+
+        return torch.stack(positions, dim=2)
     
     def update_ema(self):
         """Update EMA parameters"""
@@ -683,7 +550,11 @@ class DDPMTrainer(object):
             cur_epoch, it = self.load(model_dir)
         
         start_time = time.time()
-        scaler = GradScaler()
+        amp_enabled = torch.cuda.is_available() and getattr(self.opt, "use_amp", False)
+        if _USE_TORCH_AMP:
+            scaler = GradScaler("cuda", enabled=amp_enabled)
+        else:
+            scaler = GradScaler(enabled=amp_enabled)
         logs = OrderedDict()
         
         for epoch in range(cur_epoch, self.opt.num_epochs):
@@ -694,10 +565,16 @@ class DDPMTrainer(object):
                 if batch_data is None:
                     continue
                 
-                #  Forward pass với autocast
-                with autocast():
+                # Forward diffusion path under AMP
+                if _USE_TORCH_AMP:
+                    amp_ctx = autocast(device_type='cuda', enabled=amp_enabled)
+                else:
+                    amp_ctx = autocast(enabled=amp_enabled)
+
+                with amp_ctx:
                     self.forward(batch_data)
-                    loss_logs = self.backward_G()
+                # Compute composite losses outside AMP for better numerical stability.
+                loss_logs = self.backward_G()
                 
                 #  Backward pass với scaler
                 self.zero_grad([self.opt_encoder])
@@ -735,4 +612,4 @@ class DDPMTrainer(object):
                     total_it=it
                 )
             
-            print(f" Epoch {epoch} completed")
+            print(f" Epoch {epoch} completed successfully. Time elapsed: {(time.time() - start_time)/60:.2f} mins.")
