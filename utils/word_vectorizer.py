@@ -62,7 +62,12 @@ class WordVectorizer(object):
         return len(self.word2vec)
 
     def __getitem__(self, item):
-        word, pos = item.split('/')
+        # BEAT captions may contain plain tokens without POS tag.
+        # Fallback to OTHER instead of crashing on malformed tokens.
+        if '/' in item:
+            word, pos = item.rsplit('/', 1)
+        else:
+            word, pos = item, 'OTHER'
         if word in self.word2vec:
             word_vec = self.word2vec[word]
             vip_pos = None

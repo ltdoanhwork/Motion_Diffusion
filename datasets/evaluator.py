@@ -193,6 +193,9 @@ class EvaluationDataset(Dataset):
 
 
 def collate_fn(batch):
+    batch = [x for x in batch if x is not None]
+    if len(batch) == 0:
+        raise ValueError("All samples in batch are invalid (None).")
     batch.sort(key=lambda x: x[3], reverse=True)
     return default_collate(batch)
 

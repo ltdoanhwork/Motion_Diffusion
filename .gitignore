@@ -65,6 +65,7 @@ datasets/BEAT_numpy_old/
 datasets/BEAT_indices/
 datasets/HumanML3D/
 datasets/KIT-ML/
+datasets/glove/
 
 emage_evaltools/
 
