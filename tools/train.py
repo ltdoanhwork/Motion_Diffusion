@@ -41,7 +41,7 @@ def validate_dataset(dataset):
         except Exception as e:
             print(f"[Dataset ERROR] idx={i}, name={dataset.name_list[i]}: {e}")
             bad_samples.append(dataset.name_list[i])
-    print(f"✅ Tổng số lỗi: {len(bad_samples)} / {len(dataset)}")
+    print(f" Tổng số lỗi: {len(bad_samples)} / {len(dataset)}")
     return bad_samples
 
 def create_train_test_splits(motion_dir, train_file, test_file, test_ratio=0.1, split_seed=3407):

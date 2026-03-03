@@ -375,13 +375,21 @@ def evaluate_matching_score(motion_loaders, file):
         with torch.no_grad():
             for idx, batch in enumerate(motion_loader):
                 word_embeddings, pos_one_hots, _, sent_lens, motions, m_lens, _ = batch
-                text_embeddings, motion_embeddings = eval_wrapper.get_co_embeddings(
-                    word_embs=word_embeddings,
-                    pos_ohot=pos_one_hots,
-                    cap_lens=sent_lens,
-                    motions=motions,
-                    m_lens=m_lens
-                )
+                if hasattr(eval_wrapper, "get_co_embeddings_from_captions"):
+                    captions = batch[2]
+                    text_embeddings, motion_embeddings = eval_wrapper.get_co_embeddings_from_captions(
+                        captions=captions,
+                        motions=motions,
+                        m_lens=m_lens,
+                    )
+                else:
+                    text_embeddings, motion_embeddings = eval_wrapper.get_co_embeddings(
+                        word_embs=word_embeddings,
+                        pos_ohot=pos_one_hots,
+                        cap_lens=sent_lens,
+                        motions=motions,
+                        m_lens=m_lens
+                    )
                 assert not np.isnan(text_embeddings.cpu().numpy()).any(), "Text embeddings contain NaN values"
                 assert not np.isnan(motion_embeddings.cpu().numpy()).any(), "Motion embeddings contain NaN values"
                 assert not np.isinf(text_embeddings.cpu().numpy()).any(), "Text embeddings contain Inf values"
@@ -639,11 +647,11 @@ if __name__ == '__main__':
         raise SystemExit("Usage: python tools/evaluation.py <opt.txt>")
 
     mm_num_samples = 20 # 100
-    mm_num_repeats = 2 # 30
+    mm_num_repeats = 10 # 30
     mm_num_times = 8 # 10
     diversity_times = 300
     replication_times = 1
-    batch_size = 64
+    batch_size = 32
 
     opt_path = sys.argv[1]
 
@@ -666,14 +674,28 @@ if __name__ == '__main__':
     eval_wrapper = None
     wrapper_opt = get_opt(opt_path, device)
     _setup_dataset(wrapper_opt)
+    default_sbert_ckpt = pjoin(ROOT, 'checkpoints', 'beat', 'text_mot_match_sbert', 'model', 'finest.tar')
+    evaluator_type = getattr(wrapper_opt, "evaluator_type", None)
+    if evaluator_type is None:
+        if wrapper_opt.dataset_name == "beat" and os.path.exists(default_sbert_ckpt):
+            evaluator_type = "sbert"
+        else:
+            evaluator_type = "legacy"
     if not hasattr(wrapper_opt, 'evaluator_path'):
         if wrapper_opt.dataset_name == 'beat':
-            wrapper_opt.evaluator_path = pjoin(ROOT, 'checkpoints', 'beat', 'text_mot_match', 'model', 'finest.tar')
+            if evaluator_type == "sbert":
+                wrapper_opt.evaluator_path = pjoin(ROOT, 'checkpoints', 'beat', 'text_mot_match_sbert', 'model', 'finest.tar')
+            else:
+                wrapper_opt.evaluator_path = pjoin(ROOT, 'checkpoints', 'beat', 'text_mot_match', 'model', 'finest.tar')
         else:
             wrapper_opt.evaluator_path = pjoin(ROOT, 'checkpoints', 't2m', 'text_mot_match', 'model', 'finest.tar')
     if os.path.exists(wrapper_opt.evaluator_path):
         run_text_metrics = True
-        eval_wrapper = EvaluatorModelWrapper(wrapper_opt)
+        if wrapper_opt.dataset_name == "beat" and evaluator_type == "sbert":
+            from datasets.evaluator_sbert import EvaluatorModelWrapperSBERT
+            eval_wrapper = EvaluatorModelWrapperSBERT(wrapper_opt)
+        else:
+            eval_wrapper = EvaluatorModelWrapper(wrapper_opt)
     elif opt.dataset_name in ['t2m', 'kit']:
         raise FileNotFoundError(f"Evaluator checkpoint not found: {wrapper_opt.evaluator_path}")
     else:

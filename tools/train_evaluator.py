@@ -372,7 +372,7 @@ def main():
 
     source_opt.data_root = pjoin(ROOT, "datasets", "BEAT_numpy")
     source_opt.motion_dir = pjoin(source_opt.data_root, "npy")
-    source_opt.text_dir = pjoin(source_opt.data_root, "txt")
+    source_opt.text_dir = args.text_dir if args.text_dir else pjoin(source_opt.data_root, "txt")
     source_opt.max_motion_length = getattr(source_opt, "max_motion_length", 360)
     source_opt.max_text_len = getattr(source_opt, "max_text_len", 20)
     source_opt.motion_rep = getattr(source_opt, "motion_rep", "axis_angle")
@@ -388,8 +388,8 @@ def main():
     mean = np.load(mean_path)
     std = np.load(std_path)
 
-    train_split = pjoin(source_opt.data_root, "train.txt")
-    val_split = pjoin(source_opt.data_root, "val.txt")
+    train_split = args.train_split if args.train_split else pjoin(source_opt.data_root, "train.txt")
+    val_split = args.val_split if args.val_split else pjoin(source_opt.data_root, "val.txt")
     if not os.path.exists(val_split):
         val_split = pjoin(source_opt.data_root, "test.txt")
 
