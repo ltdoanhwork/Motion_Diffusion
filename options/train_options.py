@@ -20,7 +20,7 @@ class TrainCompOptions(BaseOptions):
                                  help='What the model predicts (noise, v, or x0)')
         
         # ==================== Training Hyperparameters ====================
-        self.parser.add_argument('--num_epochs', type=int, default=51, help='Number of epochs')
+        self.parser.add_argument('--num_epochs', type=int, default=101, help='Number of epochs')
         self.parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
         self.parser.add_argument('--batch_size', type=int, default=32, help='Batch size per GPU')
         self.parser.add_argument('--times', type=int, default=1, help='times of dataset')
@@ -57,6 +57,22 @@ class TrainCompOptions(BaseOptions):
                                  help='Use automatic mixed precision training')
         self.parser.add_argument('--max_grad_norm', type=float, default=1.0,
                                  help='Maximum gradient norm for clipping')
+        self.parser.add_argument('--use_min_snr_weighting', action='store_true',
+                                 help='Apply Min-SNR weighting to diffusion reconstruction loss')
+        self.parser.add_argument('--min_snr_gamma', type=float, default=5.0,
+                                 help='Clamp value gamma for Min-SNR weighting: w_t=min(SNR(t), gamma)')
+        self.parser.add_argument('--use_uncertainty_weighting', action='store_true',
+                                 help='Use Kendall uncertainty weighting across active loss terms')
+        self.parser.add_argument('--uncertainty_lr_scale', type=float, default=10.0,
+                                 help='LR multiplier for uncertainty parameters (log_sigma_*)')
+        self.parser.add_argument('--init_log_sigma_diff', type=float, default=0.0,
+                                 help='Initial value for log_sigma_diff when uncertainty weighting is enabled')
+        self.parser.add_argument('--init_log_sigma_vel', type=float, default=0.0,
+                                 help='Initial value for log_sigma_vel when uncertainty weighting is enabled')
+        self.parser.add_argument('--init_log_sigma_acc', type=float, default=0.0,
+                                 help='Initial value for log_sigma_acc when uncertainty weighting is enabled')
+        self.parser.add_argument('--init_log_sigma_geom', type=float, default=0.0,
+                                 help='Initial value for log_sigma_geom when uncertainty weighting is enabled')
         
         # ==================== Classifier-Free Guidance ====================
         self.parser.add_argument('--cfg_dropout', type=float, default=0.1,
@@ -69,6 +85,6 @@ class TrainCompOptions(BaseOptions):
         self.parser.add_argument('--log_every', type=int, default=50, help='Frequency of printing training progress (by iteration)')
         self.parser.add_argument('--save_every_e', type=int, default=10, help='Frequency of saving models (by epoch)')
         self.parser.add_argument('--eval_every_e', type=int, default=10, help='Frequency of animation results (by epoch)')
-        self.parser.add_argument('--save_latest', type=int, default=500, help='Frequency of saving models (by iteration)')
+        self.parser.add_argument('--save_latest', type=int, default=1, help='Frequency of saving models (by iteration)')
         
         self.is_train = True

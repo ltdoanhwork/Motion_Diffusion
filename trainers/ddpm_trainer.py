@@ -2,6 +2,8 @@ import torch
 import torch.nn.functional as F
 import random
 import time
+import os
+import numpy as np
 from models.transformer import MotionTransformer
 from torch.utils.data import DataLoader
 import torch.optim as optim
@@ -56,6 +58,36 @@ class DDPMTrainer(object):
 
         self.sampler = create_named_schedule_sampler(sampler, self.diffusion)
         self.sampler_name = sampler
+        self.use_min_snr_weighting = getattr(args, "use_min_snr_weighting", False)
+        self.min_snr_gamma = float(getattr(args, "min_snr_gamma", 5.0))
+        self.use_uncertainty_weighting = getattr(args, "use_uncertainty_weighting", False)
+        self.uncertainty_lr_scale = float(getattr(args, "uncertainty_lr_scale", 10.0))
+        self.init_log_sigma_diff = float(getattr(args, "init_log_sigma_diff", 0.0))
+        self.init_log_sigma_vel = float(getattr(args, "init_log_sigma_vel", 0.0))
+        self.init_log_sigma_acc = float(getattr(args, "init_log_sigma_acc", 0.0))
+        self.init_log_sigma_geom = float(getattr(args, "init_log_sigma_geom", 0.0))
+        self.alphas_cumprod_t = torch.tensor(
+            self.diffusion.alphas_cumprod, dtype=torch.float32, device=self.device
+        )
+        self._printed_geom_unit_info = False
+
+        if self.use_uncertainty_weighting:
+            self.log_sigma_diff = torch.nn.Parameter(torch.tensor(self.init_log_sigma_diff, device=self.device))
+            self.log_sigma_vel = torch.nn.Parameter(torch.tensor(self.init_log_sigma_vel, device=self.device))
+            self.log_sigma_acc = torch.nn.Parameter(torch.tensor(self.init_log_sigma_acc, device=self.device))
+            self.log_sigma_geom = torch.nn.Parameter(torch.tensor(self.init_log_sigma_geom, device=self.device))
+
+        self.motion_mean = None
+        self.motion_std = None
+        mean_path = pjoin(getattr(self.opt, "meta_dir", ""), "mean.npy")
+        std_path = pjoin(getattr(self.opt, "meta_dir", ""), "std.npy")
+        if os.path.exists(mean_path) and os.path.exists(std_path):
+            mean_np = np.load(mean_path).astype(np.float32)
+            std_np = np.load(std_path).astype(np.float32)
+            self.motion_mean = torch.from_numpy(mean_np).to(self.device).view(1, 1, -1)
+            self.motion_std = torch.from_numpy(std_np).to(self.device).view(1, 1, -1)
+        else:
+            print("[WARN] mean/std not found in meta_dir; geometric loss will use normalized motion.")
 
         if args.is_train:
             self.mse_criterion = torch.nn.MSELoss(reduction='none')
@@ -128,6 +160,7 @@ class DDPMTrainer(object):
         B, T = x_start.shape[:2]
         cur_len = torch.LongTensor([min(T, m_len) for m_len in  m_lens]).to(self.device)
         t, _ = self.sampler.sample(B, x_start.device)
+        self.timesteps = t
         output = self.diffusion.training_losses(
             model=self.encoder,
             x_start=x_start,
@@ -231,8 +264,16 @@ class DDPMTrainer(object):
         pred_motion = self.pred_xstart.float()
         gt_motion = self.motions.float()
 
-        loss_mot_rec = self.mse_criterion(fake_noise, real_noise).mean(dim=-1)
-        loss_mot_rec = (loss_mot_rec * src_mask).sum() / src_mask.sum()
+        diff_per_frame = self.mse_criterion(fake_noise, real_noise).mean(dim=-1)  # (B, T)
+        valid_per_sample = src_mask.sum(dim=1) + 1e-8
+        diff_per_sample = (diff_per_frame * src_mask).sum(dim=1) / valid_per_sample  # (B,)
+        if self.use_min_snr_weighting:
+            alpha_bar = self.alphas_cumprod_t[self.timesteps.long()].clamp(min=1e-8, max=1.0 - 1e-8)
+            snr_t = alpha_bar / (1.0 - alpha_bar)
+            w_t = torch.clamp(snr_t, max=self.min_snr_gamma).to(diff_per_sample.dtype)
+            loss_diff = (w_t * diff_per_sample).mean()
+        else:
+            loss_diff = diff_per_sample.mean()
         
         loss_vel = None
         loss_acc = None
@@ -246,7 +287,6 @@ class DDPMTrainer(object):
             vel_sq = self.mse_criterion(vel_pred, vel_gt) * vel_mask
             denom_vel = vel_mask.sum() * vel_pred.shape[-1] + 1e-8
             loss_vel = vel_sq.sum() / denom_vel
-            loss_mot_rec = loss_mot_rec + self.opt.velocity_weight * loss_vel
         
         # THÊM: Acceleration Loss (motion smoother)
         if self.opt.use_acceleration_loss and loss_vel is not None:
@@ -256,34 +296,68 @@ class DDPMTrainer(object):
             acc_sq = self.mse_criterion(acc_pred, acc_gt) * acc_mask
             denom_acc = acc_mask.sum() * acc_pred.shape[-1] + 1e-8
             loss_acc = acc_sq.sum() / denom_acc
-            loss_mot_rec = loss_mot_rec + self.opt.acceleration_weight * loss_acc
         
         # THÊM: Geometric Loss (Bone length consistency)
         if self.opt.use_geometric_loss:
+            pred_motion_geom = self._denormalize_motion(pred_motion)
+            gt_motion_geom = self._denormalize_motion(gt_motion)
             # Geometric/FK path is numerically sensitive under FP16; force FP32.
             if _USE_TORCH_AMP:
                 with autocast(device_type='cuda', enabled=False):
                     loss_geom = self.compute_geometric_loss(
-                        pred_motion.float(),
-                        gt_motion.float(),
+                        pred_motion_geom.float(),
+                        gt_motion_geom.float(),
                         src_mask=src_mask,
                     )
             else:
                 with autocast(enabled=False):
                     loss_geom = self.compute_geometric_loss(
-                        pred_motion.float(),
-                        gt_motion.float(),
+                        pred_motion_geom.float(),
+                        gt_motion_geom.float(),
                         src_mask=src_mask,
                     )
-            loss_mot_rec = loss_mot_rec + self.opt.geometric_weight * loss_geom
-        
-        if not torch.isfinite(loss_mot_rec):
+
+        if self.use_uncertainty_weighting:
+            contrib_diff_data = 0.5 * torch.exp(-2.0 * self.log_sigma_diff) * loss_diff
+            contrib_diff_total = contrib_diff_data + self.log_sigma_diff
+            total_loss = contrib_diff_total
+            contrib_vel_data = torch.tensor(0.0, device=total_loss.device)
+            contrib_acc_data = torch.tensor(0.0, device=total_loss.device)
+            contrib_geom_data = torch.tensor(0.0, device=total_loss.device)
+            contrib_vel_total = torch.tensor(0.0, device=total_loss.device)
+            contrib_acc_total = torch.tensor(0.0, device=total_loss.device)
+            contrib_geom_total = torch.tensor(0.0, device=total_loss.device)
+            if self.opt.use_velocity_loss and loss_vel is not None:
+                contrib_vel_data = 0.5 * torch.exp(-2.0 * self.log_sigma_vel) * loss_vel
+                contrib_vel_total = contrib_vel_data + self.log_sigma_vel
+                total_loss = total_loss + contrib_vel_total
+            if self.opt.use_acceleration_loss and loss_acc is not None:
+                contrib_acc_data = 0.5 * torch.exp(-2.0 * self.log_sigma_acc) * loss_acc
+                contrib_acc_total = contrib_acc_data + self.log_sigma_acc
+                total_loss = total_loss + contrib_acc_total
+            if self.opt.use_geometric_loss and loss_geom is not None:
+                contrib_geom_data = 0.5 * torch.exp(-2.0 * self.log_sigma_geom) * loss_geom
+                contrib_geom_total = contrib_geom_data + self.log_sigma_geom
+                total_loss = total_loss + contrib_geom_total
+        else:
+            total_loss = loss_diff
+            if self.opt.use_velocity_loss and loss_vel is not None:
+                total_loss = total_loss + self.opt.velocity_weight * loss_vel
+            if self.opt.use_acceleration_loss and loss_acc is not None:
+                total_loss = total_loss + self.opt.acceleration_weight * loss_acc
+            if self.opt.use_geometric_loss and loss_geom is not None:
+                total_loss = total_loss + self.opt.geometric_weight * loss_geom
+
+        if not torch.isfinite(total_loss):
             raise RuntimeError("Non-finite loss detected (nan/inf). Try lower aux loss weights or disable AMP.")
 
-        self.loss_mot_rec = loss_mot_rec
+        self.loss_mot_rec = total_loss
         loss_logs = OrderedDict({
             'loss_mot_rec': self.loss_mot_rec.item()
         })
+        loss_logs['loss_diff'] = loss_diff.item()
+        if self.use_min_snr_weighting:
+            loss_logs['loss_diff_minsnr'] = loss_diff.item()
         
         if self.opt.use_velocity_loss:
             loss_logs['loss_vel'] = loss_vel.item()
@@ -291,8 +365,28 @@ class DDPMTrainer(object):
             loss_logs['loss_acc'] = loss_acc.item()
         if self.opt.use_geometric_loss:
             loss_logs['loss_geom'] = loss_geom.item()
+        if self.use_uncertainty_weighting:
+            loss_logs['sigma_diff'] = torch.exp(self.log_sigma_diff).item()
+            loss_logs['sigma_vel'] = torch.exp(self.log_sigma_vel).item()
+            loss_logs['sigma_acc'] = torch.exp(self.log_sigma_acc).item()
+            loss_logs['sigma_geom'] = torch.exp(self.log_sigma_geom).item()
+            loss_logs['contrib_diff_data'] = contrib_diff_data.item()
+            loss_logs['contrib_diff_total'] = contrib_diff_total.item()
+            loss_logs['contrib_vel_data'] = contrib_vel_data.item()
+            loss_logs['contrib_vel_total'] = contrib_vel_total.item()
+            loss_logs['contrib_acc_data'] = contrib_acc_data.item()
+            loss_logs['contrib_acc_total'] = contrib_acc_total.item()
+            loss_logs['contrib_geom_data'] = contrib_geom_data.item()
+            loss_logs['contrib_geom_total'] = contrib_geom_total.item()
         
         return loss_logs
+
+    def _denormalize_motion(self, motion):
+        if self.motion_mean is None or self.motion_std is None:
+            return motion
+        if motion.shape[-1] != self.motion_mean.shape[-1]:
+            return motion
+        return motion * self.motion_std + self.motion_mean
 
     def compute_geometric_loss(self, motion_pred, motion_gt, src_mask=None):
         # 2. Reshape về (B, T, J, 3) 
@@ -331,8 +425,10 @@ class DDPMTrainer(object):
             fk_sq = (positions_pred - positions_gt) ** 2
             fk_per_frame = fk_sq.mean(dim=(-1, -2))
             fk_loss = (fk_per_frame * src_mask).sum() / valid_frames
-            fk_weight = getattr(self.opt, 'fk_weight', 1.0)
-            fk_loss = fk_loss * fk_weight
+            # In uncertainty-weighting mode, avoid manual hand-tuned scaling.
+            if not self.use_uncertainty_weighting:
+                fk_weight = getattr(self.opt, 'fk_weight', 1.0)
+                fk_loss = fk_loss * fk_weight
 
         pred_parent_pos = torch.index_select(positions_pred, 2, self.bone_parent_indices)
         pred_child_pos = torch.index_select(positions_pred, 2, self.bone_child_indices)
@@ -347,6 +443,23 @@ class DDPMTrainer(object):
         # Tính độ dài xương
         bone_len_pred = torch.norm(bone_pred, dim=-1, keepdim=True) + 1e-6
         bone_len_gt = torch.norm(bone_gt, dim=-1, keepdim=True) + 1e-6
+
+        # Quick fix: auto-check unit scale and convert mm -> m if needed.
+        # Typical human bone length in mm is often >100; in meters it's <2.
+        median_bone_len = torch.median(bone_len_gt.detach())
+        if median_bone_len > 100.0:
+            positions_pred = positions_pred * 0.001
+            positions_gt = positions_gt * 0.001
+            bone_pred = bone_pred * 0.001
+            bone_gt = bone_gt * 0.001
+            bone_len_pred = bone_len_pred * 0.001
+            bone_len_gt = bone_len_gt * 0.001
+            if not self._printed_geom_unit_info:
+                print("[INFO] Geometric/FK: detected mm-scale joints, converted to meters (x0.001).")
+                self._printed_geom_unit_info = True
+        elif not self._printed_geom_unit_info:
+            print("[INFO] Geometric/FK: joint scale does not look like mm; keep original unit.")
+            self._printed_geom_unit_info = True
         
         # Loss 1: Direction (Cosine similarity)
         bone_pred_norm = bone_pred / bone_len_pred
@@ -480,6 +593,15 @@ class DDPMTrainer(object):
         if self.opt.is_train:
             self.mse_criterion.to(device)
         self.encoder = self.encoder.to(device)
+        self.alphas_cumprod_t = self.alphas_cumprod_t.to(device)
+        if self.motion_mean is not None and self.motion_std is not None:
+            self.motion_mean = self.motion_mean.to(device)
+            self.motion_std = self.motion_std.to(device)
+        if self.use_uncertainty_weighting:
+            self.log_sigma_diff.data = self.log_sigma_diff.data.to(device)
+            self.log_sigma_vel.data = self.log_sigma_vel.data.to(device)
+            self.log_sigma_acc.data = self.log_sigma_acc.data.to(device)
+            self.log_sigma_geom.data = self.log_sigma_geom.data.to(device)
 
     def train_mode(self):
         self.encoder.train()
@@ -499,6 +621,13 @@ class DDPMTrainer(object):
             state['encoder'] = self.encoder.state_dict()
         if hasattr(self, 'scheduler'):
             state['scheduler'] = self.scheduler.state_dict()
+        if self.use_uncertainty_weighting:
+            state['uncertainty'] = {
+                'log_sigma_diff': self.log_sigma_diff.detach().cpu(),
+                'log_sigma_vel': self.log_sigma_vel.detach().cpu(),
+                'log_sigma_acc': self.log_sigma_acc.detach().cpu(),
+                'log_sigma_geom': self.log_sigma_geom.detach().cpu(),
+            }
         torch.save(state, file_name)
         return
 
@@ -509,11 +638,31 @@ class DDPMTrainer(object):
         self.encoder.load_state_dict(checkpoint['encoder'], strict=True)
         if 'scheduler' in checkpoint and hasattr(self, 'scheduler'):
             self.scheduler.load_state_dict(checkpoint['scheduler'])
+        if self.use_uncertainty_weighting and 'uncertainty' in checkpoint:
+            unc = checkpoint['uncertainty']
+            self.log_sigma_diff.data.copy_(unc['log_sigma_diff'].to(self.device))
+            self.log_sigma_vel.data.copy_(unc['log_sigma_vel'].to(self.device))
+            self.log_sigma_acc.data.copy_(unc['log_sigma_acc'].to(self.device))
+            self.log_sigma_geom.data.copy_(unc['log_sigma_geom'].to(self.device))
         return checkpoint['ep'], checkpoint.get('total_it', 0)
 
     def train(self, train_dataset):
         self.to(self.device)
-        self.opt_encoder = optim.AdamW(self.encoder.parameters(), lr=self.opt.lr)
+        optim_params = [{'params': list(self.encoder.parameters()), 'lr': self.opt.lr}]
+        if self.use_uncertainty_weighting:
+            sigma_lr = self.opt.lr * self.uncertainty_lr_scale
+            optim_params.append({
+                'params': [
+                    self.log_sigma_diff,
+                    self.log_sigma_vel,
+                    self.log_sigma_acc,
+                    self.log_sigma_geom,
+                ],
+                'lr': sigma_lr,
+                'weight_decay': 0.0,
+            })
+            print(f"[INFO] Uncertainty LR group enabled: sigma_lr={sigma_lr:.2e}")
+        self.opt_encoder = optim.AdamW(optim_params, lr=self.opt.lr)
         
         # Build dataloader TRƯỚC khi tạo scheduler
         train_loader = build_dataloader(
@@ -522,10 +671,14 @@ class DDPMTrainer(object):
             drop_last=True,
             workers_per_gpu=4,
             shuffle=True)
-        
-        # Tính đúng T_max
-        total_steps = len(train_loader) * self.opt.num_epochs
-        warmup_steps = min(500, len(train_loader))  # Warmup 1 epoch hoặc 500 steps
+
+        grad_accum_steps = max(1, int(getattr(self.opt, "gradient_accumulation_steps", 1)))
+
+        # Tính đúng T_max theo số optimizer steps (không phải micro-batches)
+        steps_per_epoch = max(1, (len(train_loader) + grad_accum_steps - 1) // grad_accum_steps)
+        total_steps = steps_per_epoch * self.opt.num_epochs
+        warmup_steps = min(500, steps_per_epoch)  # Warmup 1 epoch hoặc 500 optimizer steps
+        cosine_tmax = max(1, total_steps - warmup_steps)
         
         warmup_scheduler = LinearLR(
             self.opt_encoder, 
@@ -534,7 +687,7 @@ class DDPMTrainer(object):
         )
         cosine_scheduler = CosineAnnealingLR(
             self.opt_encoder, 
-            T_max=total_steps - warmup_steps,
+            T_max=cosine_tmax,
             eta_min=1e-6
         )
         self.scheduler = SequentialLR(
@@ -560,6 +713,8 @@ class DDPMTrainer(object):
         for epoch in range(cur_epoch, self.opt.num_epochs):
             self.train_mode()
             epoch_bar = tqdm(train_loader, desc=f"Epoch {epoch}", leave=False)
+            accum_counter = 0
+            self.zero_grad([self.opt_encoder])
             
             for i, batch_data in enumerate(epoch_bar):
                 if batch_data is None:
@@ -575,20 +730,23 @@ class DDPMTrainer(object):
                     self.forward(batch_data)
                 # Compute composite losses outside AMP for better numerical stability.
                 loss_logs = self.backward_G()
-                
-                #  Backward pass với scaler
-                self.zero_grad([self.opt_encoder])
-                scaler.scale(self.loss_mot_rec).backward()
-                scaler.unscale_(self.opt_encoder)
-                self.clip_norm([self.encoder])
-                scaler.step(self.opt_encoder)
-                scaler.update()  #  Reset scaler sau mỗi step
-                
-                # Update EMA
-                self.update_ema()
-                
-                # Update scheduler sau mỗi step (step-wise, không epoch-wise)
-                self.scheduler.step()
+
+                # Backward theo micro-batch, normalize loss theo accumulation steps
+                scaled_loss = self.loss_mot_rec / grad_accum_steps
+                scaler.scale(scaled_loss).backward()
+                accum_counter += 1
+
+                # Chỉ cập nhật optimizer khi đủ accumulation window
+                if accum_counter >= grad_accum_steps:
+                    scaler.unscale_(self.opt_encoder)
+                    self.clip_norm([self.encoder])
+                    scaler.step(self.opt_encoder)
+                    scaler.update()
+
+                    self.update_ema()
+                    self.scheduler.step()
+                    self.zero_grad([self.opt_encoder])
+                    accum_counter = 0
                 
                 # Logging
                 for k, v in loss_logs.items():
@@ -603,6 +761,17 @@ class DDPMTrainer(object):
                     logs = OrderedDict()
                     epoch_bar.set_postfix({k: f"{v:.4f}" for k, v in mean_loss.items()})
                     print_current_loss(start_time, it, mean_loss, epoch, inner_iter=i)
+
+            # Flush gradient còn dư nếu epoch kết thúc giữa chừng accumulation
+            if accum_counter > 0:
+                scaler.unscale_(self.opt_encoder)
+                self.clip_norm([self.encoder])
+                scaler.step(self.opt_encoder)
+                scaler.update()
+
+                self.update_ema()
+                self.scheduler.step()
+                self.zero_grad([self.opt_encoder])
             
             # Save checkpoint
             if epoch % self.opt.save_every_e == 0:
