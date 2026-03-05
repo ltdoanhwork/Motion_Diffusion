@@ -73,6 +73,14 @@ class TrainCompOptions(BaseOptions):
                                  help='Initial value for log_sigma_acc when uncertainty weighting is enabled')
         self.parser.add_argument('--init_log_sigma_geom', type=float, default=0.0,
                                  help='Initial value for log_sigma_geom when uncertainty weighting is enabled')
+        self.parser.add_argument('--use_sinkhorn_geom_loss', action='store_true',
+                                 help='Use Sinkhorn divergence as geometric loss instead of point-wise geometric/FK loss')
+        self.parser.add_argument('--sinkhorn_epsilon', type=float, default=0.05,
+                                 help='Entropic regularization epsilon for Sinkhorn divergence')
+        self.parser.add_argument('--sinkhorn_iters', type=int, default=20,
+                                 help='Number of Sinkhorn iterations')
+        self.parser.add_argument('--sinkhorn_max_frames', type=int, default=2048,
+                                 help='Max valid frames (B*T) used for Sinkhorn geometric loss; 0 means all')
         
         # ==================== Classifier-Free Guidance ====================
         self.parser.add_argument('--cfg_dropout', type=float, default=0.1,

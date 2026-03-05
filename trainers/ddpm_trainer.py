@@ -62,6 +62,10 @@ class DDPMTrainer(object):
         self.min_snr_gamma = float(getattr(args, "min_snr_gamma", 5.0))
         self.use_uncertainty_weighting = getattr(args, "use_uncertainty_weighting", False)
         self.uncertainty_lr_scale = float(getattr(args, "uncertainty_lr_scale", 10.0))
+        self.use_sinkhorn_geom_loss = getattr(args, "use_sinkhorn_geom_loss", False)
+        self.sinkhorn_epsilon = float(getattr(args, "sinkhorn_epsilon", 0.05))
+        self.sinkhorn_iters = int(getattr(args, "sinkhorn_iters", 20))
+        self.sinkhorn_max_frames = int(getattr(args, "sinkhorn_max_frames", 2048))
         self.init_log_sigma_diff = float(getattr(args, "init_log_sigma_diff", 0.0))
         self.init_log_sigma_vel = float(getattr(args, "init_log_sigma_vel", 0.0))
         self.init_log_sigma_acc = float(getattr(args, "init_log_sigma_acc", 0.0))
@@ -388,9 +392,41 @@ class DDPMTrainer(object):
             return motion
         return motion * self.motion_std + self.motion_mean
 
+    def _sinkhorn_ot_cost(self, x, y):
+        """
+        Entropic OT cost between paired point clouds x and y.
+        x, y: (N, J, 3), uniform marginals.
+        Return: (N,) OT_epsilon(x, y)
+        """
+        eps = max(self.sinkhorn_epsilon, 1e-6)
+        iters = max(self.sinkhorn_iters, 1)
+        N, J, _ = x.shape
+        C = torch.cdist(x, y, p=2) ** 2  # (N, J, J)
+
+        log_a = -torch.log(torch.tensor(float(J), device=x.device, dtype=x.dtype))
+        log_b = log_a
+        f = torch.zeros((N, J), device=x.device, dtype=x.dtype)
+        g = torch.zeros((N, J), device=x.device, dtype=x.dtype)
+
+        for _ in range(iters):
+            f = eps * (log_a - torch.logsumexp((g.unsqueeze(1) - C) / eps, dim=2))
+            g = eps * (log_b - torch.logsumexp((f.unsqueeze(2) - C) / eps, dim=1))
+
+        log_pi = (f.unsqueeze(2) + g.unsqueeze(1) - C) / eps
+        pi = torch.exp(log_pi)
+        return (pi * C).sum(dim=(1, 2))
+
+    def _sinkhorn_divergence(self, x, y):
+        """
+        Sinkhorn divergence:
+        S_eps(x, y) = OT_eps(x, y) - 0.5 OT_eps(x, x) - 0.5 OT_eps(y, y)
+        """
+        ot_xy = self._sinkhorn_ot_cost(x, y)
+        ot_xx = self._sinkhorn_ot_cost(x, x)
+        ot_yy = self._sinkhorn_ot_cost(y, y)
+        return ot_xy - 0.5 * ot_xx - 0.5 * ot_yy
+
     def compute_geometric_loss(self, motion_pred, motion_gt, src_mask=None):
-        # 2. Reshape về (B, T, J, 3) 
-        # Model của bạn vẫn đang output Axis-Angle (3 channel) nên reshape về 3 là đúng
         feat_dim = motion_pred.shape[-1]
         if feat_dim % 3 != 0:
             raise ValueError(f"Expected axis-angle feature dim divisible by 3, got {feat_dim}")
@@ -403,7 +439,6 @@ class DDPMTrainer(object):
         motion_pred_6d = axis_angle_to_rotation_6d(motion_pred_reshaped)
         motion_gt_6d = axis_angle_to_rotation_6d(motion_gt_reshaped)
         
-        # 3. Tính Positions (Giờ đầu vào đã là 6D -> Hợp lệ)
         positions_pred = self.forward_kinematics(motion_pred_6d, motion_raw=motion_pred) 
         positions_gt = self.forward_kinematics(motion_gt_6d, motion_raw=motion_gt)
 
@@ -418,29 +453,13 @@ class DDPMTrainer(object):
             src_mask = src_mask.to(device=motion_pred.device, dtype=motion_pred.dtype)
         valid_frames = src_mask.sum() + 1e-8
 
-        # --- FK LOSS (Global Position Loss) ---
-        fk_loss = torch.tensor(0.0, device=motion_pred.device, dtype=motion_pred.dtype)
-        if getattr(self.opt, 'use_fk_loss', False): 
-            # Tính MSE theo frame rồi mask các frame padding.
-            fk_sq = (positions_pred - positions_gt) ** 2
-            fk_per_frame = fk_sq.mean(dim=(-1, -2))
-            fk_loss = (fk_per_frame * src_mask).sum() / valid_frames
-            # In uncertainty-weighting mode, avoid manual hand-tuned scaling.
-            if not self.use_uncertainty_weighting:
-                fk_weight = getattr(self.opt, 'fk_weight', 1.0)
-                fk_loss = fk_loss * fk_weight
-
+        # Build bone vectors once to infer scale and for classical geom loss.
         pred_parent_pos = torch.index_select(positions_pred, 2, self.bone_parent_indices)
         pred_child_pos = torch.index_select(positions_pred, 2, self.bone_child_indices)
-        
         gt_parent_pos = torch.index_select(positions_gt, 2, self.bone_parent_indices)
         gt_child_pos = torch.index_select(positions_gt, 2, self.bone_child_indices)
-        
-        # Tính vector xương
-        bone_pred = pred_child_pos - pred_parent_pos 
-        bone_gt = gt_child_pos - gt_parent_pos      
-        
-        # Tính độ dài xương
+        bone_pred = pred_child_pos - pred_parent_pos
+        bone_gt = gt_child_pos - gt_parent_pos
         bone_len_pred = torch.norm(bone_pred, dim=-1, keepdim=True) + 1e-6
         bone_len_gt = torch.norm(bone_gt, dim=-1, keepdim=True) + 1e-6
 
@@ -460,7 +479,31 @@ class DDPMTrainer(object):
         elif not self._printed_geom_unit_info:
             print("[INFO] Geometric/FK: joint scale does not look like mm; keep original unit.")
             self._printed_geom_unit_info = True
-        
+
+        # Optional: Sinkhorn divergence geometric loss (distribution-wise on point clouds).
+        if self.use_sinkhorn_geom_loss:
+            valid_idx = (src_mask > 0.5).reshape(-1)
+            pred_clouds = positions_pred.reshape(-1, n_joints, 3)[valid_idx]
+            gt_clouds = positions_gt.reshape(-1, n_joints, 3)[valid_idx]
+            if pred_clouds.shape[0] == 0:
+                return torch.tensor(0.0, device=motion_pred.device, dtype=motion_pred.dtype)
+            if self.sinkhorn_max_frames > 0 and pred_clouds.shape[0] > self.sinkhorn_max_frames:
+                perm = torch.randperm(pred_clouds.shape[0], device=pred_clouds.device)[:self.sinkhorn_max_frames]
+                pred_clouds = pred_clouds[perm]
+                gt_clouds = gt_clouds[perm]
+            sinkhorn_vals = self._sinkhorn_divergence(pred_clouds, gt_clouds)
+            return sinkhorn_vals.mean()
+
+        # --- Classical geometric/FK loss path ---
+        fk_loss = torch.tensor(0.0, device=motion_pred.device, dtype=motion_pred.dtype)
+        if getattr(self.opt, 'use_fk_loss', False):
+            fk_sq = (positions_pred - positions_gt) ** 2
+            fk_per_frame = fk_sq.mean(dim=(-1, -2))
+            fk_loss = (fk_per_frame * src_mask).sum() / valid_frames
+            if not self.use_uncertainty_weighting:
+                fk_weight = getattr(self.opt, 'fk_weight', 1.0)
+                fk_loss = fk_loss * fk_weight
+
         # Loss 1: Direction (Cosine similarity)
         bone_pred_norm = bone_pred / bone_len_pred
         bone_gt_norm = bone_gt / bone_len_gt
@@ -762,6 +805,10 @@ class DDPMTrainer(object):
                     epoch_bar.set_postfix({k: f"{v:.4f}" for k, v in mean_loss.items()})
                     print_current_loss(start_time, it, mean_loss, epoch, inner_iter=i)
 
+                # Save latest checkpoint periodically by iteration
+                if it % self.opt.save_latest == 0:
+                    self.save(pjoin(self.opt.model_dir, 'latest.tar'), epoch, it)
+
             # Flush gradient còn dư nếu epoch kết thúc giữa chừng accumulation
             if accum_counter > 0:
                 scaler.unscale_(self.opt_encoder)
@@ -773,12 +820,18 @@ class DDPMTrainer(object):
                 self.scheduler.step()
                 self.zero_grad([self.opt_encoder])
             
-            # Save checkpoint
-            if epoch % self.opt.save_every_e == 0:
+            # Save epoch checkpoint using 1-based epoch index
+            if (epoch + 1) % self.opt.save_every_e == 0:
                 self.save(
-                    pjoin(self.opt.model_dir, 'ckpt_e%03d.tar' % epoch), 
+                    pjoin(self.opt.model_dir, 'ckpt_e%03d.tar' % (epoch + 1)), 
                     epoch, 
                     total_it=it
                 )
+
+            # Always refresh latest checkpoint at the end of each epoch
+            self.save(pjoin(self.opt.model_dir, 'latest.tar'), epoch, it)
             
             print(f" Epoch {epoch} completed successfully. Time elapsed: {(time.time() - start_time)/60:.2f} mins.")
+
+            # PYTHONPATH=. /srv/conda/envs/serverai/motiondiff/bin/python -u tools/train.py --name beat_kendall_sinkhorn --dataset_name beat --use_velocity_loss --use_acceleration_loss --use_geometric_loss --use_fk_loss --use_min_snr_weighting --use_uncertainty_weighting --use_sinkhorn_geom_loss --sinkhorn_epsilon 0.05 --sinkhorn_iters 20 --sinkhorn_max_frames 1024 
+            
