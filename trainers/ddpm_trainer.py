@@ -37,7 +37,7 @@ class DDPMTrainer(object):
         self.encoder = encoder
         self.diffusion_steps = args.diffusion_steps
         sampler = 'uniform'
-        beta_scheduler = 'cosine'
+        beta_scheduler = 'linear'
         betas = get_named_beta_schedule(beta_scheduler, self.diffusion_steps)
         self.diffusion = GaussianDiffusion(
             betas=betas,

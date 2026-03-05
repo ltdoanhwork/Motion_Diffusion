@@ -3,6 +3,7 @@ import os, random, codecs as cs, numpy as np, torch
 from os.path import join as pjoin
 from torch.utils.data import Dataset
 from tqdm import tqdm
+from typing import Optional
 import torch
 from torch.utils import data
 import numpy as np
@@ -183,8 +184,8 @@ class Beat2MotionDataset(Dataset):
     def __init__(
         self,
         opt,                       # Hyper‑parameters & paths holder (any object with the attrs below)
-        mean: np.ndarray | None,   # motion mean vector  (D,)
-        std:  np.ndarray | None,   # motion std  vector  (D,)
+        mean: Optional[np.ndarray],   # motion mean vector  (D,)
+        std: Optional[np.ndarray],    # motion std  vector  (D,)
         split_file: str,           # txt: list of clip ids to load
         times: int = 1,            # dataset “augmentation” factor
         w_vectorizer=None,         # optional word ⇒ (embedding, POS‑one‑hot)
