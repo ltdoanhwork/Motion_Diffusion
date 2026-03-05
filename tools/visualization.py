@@ -181,6 +181,18 @@ if __name__ == '__main__':
     parser.add_argument('--npy_path', type=str, default="", help='Save npy path')
     parser.add_argument('--gpu_id', type=int, default=0, help="GPU ID")
     parser.add_argument('--model_path', type=str, default="", help="Path to specific .tar checkpoint (optional)")
+    parser.add_argument('--enable_body_part_control', action='store_true',
+                        help='Enable body part-independent controlling at sampling time')
+    parser.add_argument('--body_part_control_config', type=str, default='',
+                        help='Path to body-part control JSON config')
+    parser.add_argument('--body_part_lambda1', type=float, default=0.0,
+                        help='Correction weight lambda1 for body-part control')
+    parser.add_argument('--enable_time_varied_control', action='store_true',
+                        help='Enable time-varied controlling at sampling time')
+    parser.add_argument('--time_varied_control_config', type=str, default='',
+                        help='Path to time-varied control JSON config')
+    parser.add_argument('--time_varied_lambda2', type=float, default=0.0,
+                        help='Correction weight lambda2 for time-varied control')
     args = parser.parse_args()
     
     # Setup Device
@@ -189,6 +201,12 @@ if __name__ == '__main__':
     # Load Options
     opt = get_opt(args.opt_path, device)
     opt.do_denoise = True
+    opt.enable_body_part_control = args.enable_body_part_control
+    opt.body_part_control_config = args.body_part_control_config
+    opt.body_part_lambda1 = args.body_part_lambda1
+    opt.enable_time_varied_control = args.enable_time_varied_control
+    opt.time_varied_control_config = args.time_varied_control_config
+    opt.time_varied_lambda2 = args.time_varied_lambda2
     
     # --- CẤU HÌNH ĐỘNG DỰA TRÊN DATASET NAME TRONG OPT ---
     print(f"\n🚀 Starting Generation for dataset: {opt.dataset_name.upper()}")

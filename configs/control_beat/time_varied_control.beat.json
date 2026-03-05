@@ -1,0 +1,18 @@
+{
+  "intervals": [
+    {
+      "name": "phase_1",
+      "text": "a person is walking",
+      "start": 0.0,
+      "end": 0.5,
+      "weight": 1.0
+    },
+    {
+      "name": "phase_2",
+      "text": "a person is running and waving left hand",
+      "start": 0.5,
+      "end": 1.0,
+      "weight": 1.0
+    }
+  ]
+}

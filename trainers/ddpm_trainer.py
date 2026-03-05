@@ -3,6 +3,7 @@ import torch.nn.functional as F
 import random
 import time
 import os
+import json
 import numpy as np
 from models.transformer import MotionTransformer
 from torch.utils.data import DataLoader
@@ -82,6 +83,18 @@ class DDPMTrainer(object):
         )
         self._printed_geom_unit_info = False
         self._last_geom_components = {}
+        self.enable_body_part_control = getattr(args, "enable_body_part_control", False)
+        self.enable_time_varied_control = getattr(args, "enable_time_varied_control", False)
+        self.body_part_lambda1 = float(getattr(args, "body_part_lambda1", 0.0))
+        self.time_varied_lambda2 = float(getattr(args, "time_varied_lambda2", 0.0))
+        self.body_part_control_config = self._load_control_config(
+            getattr(args, "body_part_control_config", ""),
+            expected_key="parts",
+        )
+        self.time_varied_control_config = self._load_control_config(
+            getattr(args, "time_varied_control_config", ""),
+            expected_key="intervals",
+        )
 
         if self.use_uncertainty_weighting:
             self.log_sigma_diff = torch.nn.Parameter(torch.tensor(self.init_log_sigma_diff, device=self.device))
@@ -113,6 +126,80 @@ class DDPMTrainer(object):
             self.encoder_ema = None
 
         self._init_skeleton_data()
+
+    @staticmethod
+    def _unwrap_model(model):
+        return model.module if hasattr(model, "module") else model
+
+    @staticmethod
+    def _as_length_list(length):
+        if torch.is_tensor(length):
+            return length.detach().cpu().tolist()
+        return list(length)
+
+    def _load_control_config(self, config_path, expected_key):
+        if not config_path:
+            return None
+        if not os.path.exists(config_path):
+            print(f"[WARN] Control config not found: {config_path}")
+            return None
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception as exc:
+            print(f"[WARN] Failed to load control config {config_path}: {exc}")
+            return None
+        if not isinstance(cfg, dict) or expected_key not in cfg:
+            print(f"[WARN] Invalid control config format in {config_path}. Missing key: {expected_key}")
+            return None
+        return cfg
+
+    @staticmethod
+    def _pairwise_smoothing_term(pred_terms):
+        n_terms = len(pred_terms)
+        if n_terms < 2:
+            return torch.zeros_like(pred_terms[0]) if n_terms == 1 else None
+        corr = torch.zeros_like(pred_terms[0])
+        count = 0
+        for i in range(n_terms):
+            for j in range(i + 1, n_terms):
+                diff = pred_terms[i] - pred_terms[j]
+                denom = torch.sqrt((diff * diff).sum(dim=-1, keepdim=True) + 1e-8)
+                corr = corr + (diff / denom)
+                count += 1
+        return -corr / max(count, 1)
+
+    @staticmethod
+    def _build_feature_mask(indices, dim_pose, device, dtype):
+        mask = torch.zeros(1, 1, dim_pose, device=device, dtype=dtype)
+        if indices is None:
+            return mask
+        valid_indices = [int(i) for i in indices if 0 <= int(i) < dim_pose]
+        if valid_indices:
+            mask[:, :, valid_indices] = 1.0
+        return mask
+
+    @staticmethod
+    def _interval_to_range(interval_cfg, total_len):
+        start = interval_cfg.get("start", interval_cfg.get("l", 0))
+        end = interval_cfg.get("end", interval_cfg.get("r", total_len))
+        if isinstance(start, float) and 0.0 <= start <= 1.0:
+            start = int(round(start * total_len))
+        if isinstance(end, float) and 0.0 <= end <= 1.0:
+            end = int(round(end * total_len))
+        start = max(0, min(int(start), total_len))
+        end = max(start + 1, min(int(end), total_len))
+        return start, end
+
+    def _expand_text_condition(self, text_value, batch_size):
+        if isinstance(text_value, str):
+            return [text_value] * batch_size
+        if isinstance(text_value, list):
+            if len(text_value) == batch_size:
+                return text_value
+            if len(text_value) == 1:
+                return text_value * batch_size
+        raise ValueError("Control text must be a string or list with length equal to batch size.")
 
     def _init_skeleton_data(self):
         """
@@ -188,15 +275,34 @@ class DDPMTrainer(object):
         except:
             self.src_mask = self.encoder.generate_src_mask(T, cur_len).to(x_start.device)
 
-    def generate_batch(self, caption, m_lens, dim_pose, guidance_scale=4.5):
+    def generate_batch(
+        self,
+        caption,
+        m_lens,
+        dim_pose,
+        guidance_scale=4.5,
+        body_part_control=None,
+        time_varied_control=None,
+        model=None,
+    ):
+        model = self._unwrap_model(self.encoder if model is None else model)
+        m_lens_list = self._as_length_list(m_lens)
+        B = len(caption)
+
         # 1. Encode text thật
-        xf_proj, xf_out = self.encoder.encode_text(caption, self.device)
+        xf_proj, xf_out = model.encode_text(caption, self.device)
 
         # 2. Encode text rỗng (Unconditional)
-        B = len(caption)
         uncond_caption = [""] * B
-        xf_proj_uncond, xf_out_uncond = self.encoder.encode_text(uncond_caption, self.device)
-        
+        xf_proj_uncond, xf_out_uncond = model.encode_text(uncond_caption, self.device)
+
+        body_cfg = None
+        time_cfg = None
+        if self.enable_body_part_control:
+            body_cfg = body_part_control if body_part_control is not None else self.body_part_control_config
+        if self.enable_time_varied_control:
+            time_cfg = time_varied_control if time_varied_control is not None else self.time_varied_control_config
+
         # --- MODEL WRAPPER ---
         def model_fn(x, t, **kwargs):
             # Lấy cond và uncond từ kwargs
@@ -206,7 +312,7 @@ class DDPMTrainer(object):
             if cond_dict is None or uncond_dict is None:
                  # Fallback phòng trường hợp library truyền tham số kiểu khác
                  # (Thường không vào đây nếu gọi đúng chuẩn)
-                 return self.encoder(x, t, **kwargs)
+                 return model(x, t, **kwargs)
 
             # x_in: (2*B, T, D)
             x_in = torch.cat([x, x], dim=0)
@@ -222,15 +328,90 @@ class DDPMTrainer(object):
                     combined_kwargs[k] = cond_dict[k] + uncond_dict[k]
 
             # Unpack dictionary để truyền đúng vào các tham số (length, xf_proj, xf_out...)
-            out_combined = self.encoder(x_in, t_in, **combined_kwargs)
+            out_combined = model(x_in, t_in, **combined_kwargs)
             
             # Tách kết quả ra
             out_cond, out_uncond = torch.split(out_combined, B, dim=0)
             
             # Công thức CFG
-            return out_uncond + guidance_scale * (out_cond - out_uncond)
+            base_pred = out_uncond + guidance_scale * (out_cond - out_uncond)
 
-        T = min(m_lens.max(), self.encoder.num_frames)
+            controlled_preds = []
+
+            if isinstance(body_cfg, dict) and body_cfg.get("parts"):
+                body_terms = []
+                body_raw_preds = []
+                coverage = torch.zeros_like(base_pred[:, :1, :])
+                for part_cfg in body_cfg["parts"]:
+                    part_text = self._expand_text_condition(part_cfg.get("text", ""), B)
+                    part_weight = float(part_cfg.get("weight", 1.0))
+                    part_xf_proj, part_xf_out = model.encode_text(part_text, self.device)
+                    out_part = model(
+                        x,
+                        t,
+                        length=cond_dict.get("length", m_lens_list),
+                        xf_proj=part_xf_proj,
+                        xf_out=part_xf_out,
+                    )
+                    guided_part = out_uncond + guidance_scale * (out_part - out_uncond)
+                    feat_mask = self._build_feature_mask(
+                        part_cfg.get("indices"),
+                        dim_pose=x.shape[-1],
+                        device=x.device,
+                        dtype=x.dtype,
+                    )
+                    body_terms.append(guided_part * feat_mask * part_weight)
+                    body_raw_preds.append(guided_part)
+                    coverage = coverage + feat_mask
+
+                if body_terms:
+                    body_pred = torch.stack(body_terms, dim=0).sum(dim=0)
+                    correction = self._pairwise_smoothing_term(body_raw_preds)
+                    if correction is not None and self.body_part_lambda1 != 0.0:
+                        body_pred = body_pred + self.body_part_lambda1 * correction
+                    uncovered = (coverage <= 0).to(base_pred.dtype)
+                    body_pred = body_pred + uncovered * base_pred
+                    controlled_preds.append(body_pred)
+
+            if isinstance(time_cfg, dict) and time_cfg.get("intervals"):
+                time_terms = []
+                time_raw_preds = []
+                T = x.shape[1]
+                coverage = torch.zeros(1, T, 1, device=x.device, dtype=x.dtype)
+                for interval_cfg in time_cfg["intervals"]:
+                    interval_text = self._expand_text_condition(interval_cfg.get("text", ""), B)
+                    interval_weight = float(interval_cfg.get("weight", 1.0))
+                    start, end = self._interval_to_range(interval_cfg, T)
+                    time_xf_proj, time_xf_out = model.encode_text(interval_text, self.device)
+                    out_time = model(
+                        x,
+                        t,
+                        length=cond_dict.get("length", m_lens_list),
+                        xf_proj=time_xf_proj,
+                        xf_out=time_xf_out,
+                    )
+                    guided_time = out_uncond + guidance_scale * (out_time - out_uncond)
+                    interval_mask = torch.zeros(1, T, 1, device=x.device, dtype=x.dtype)
+                    interval_mask[:, start:end, :] = 1.0
+                    padded_term = guided_time * interval_mask * interval_weight
+                    time_terms.append(padded_term)
+                    time_raw_preds.append(padded_term)
+                    coverage = coverage + interval_mask
+
+                if time_terms:
+                    time_pred = torch.stack(time_terms, dim=0).sum(dim=0)
+                    correction = self._pairwise_smoothing_term(time_raw_preds)
+                    if correction is not None and self.time_varied_lambda2 != 0.0:
+                        time_pred = time_pred + self.time_varied_lambda2 * correction
+                    uncovered = (coverage <= 0).to(base_pred.dtype)
+                    time_pred = time_pred + uncovered * base_pred
+                    controlled_preds.append(time_pred)
+
+            if controlled_preds:
+                return torch.stack(controlled_preds, dim=0).mean(dim=0)
+            return base_pred
+
+        T = min(max(m_lens_list), model.num_frames)
 
         # Gọi p_sample_loop
         output = self.diffusion.p_sample_loop(
@@ -239,8 +420,8 @@ class DDPMTrainer(object):
             clip_denoised=False,
             progress=True,
             model_kwargs={
-                'cond': {'xf_proj': xf_proj, 'xf_out': xf_out, 'length': m_lens},
-                'uncond': {'xf_proj': xf_proj_uncond, 'xf_out': xf_out_uncond, 'length': m_lens}
+                'cond': {'xf_proj': xf_proj, 'xf_out': xf_out, 'length': m_lens_list},
+                'uncond': {'xf_proj': xf_proj_uncond, 'xf_out': xf_out_uncond, 'length': m_lens_list}
             },
             device=self.device 
         )
@@ -252,6 +433,8 @@ class DDPMTrainer(object):
         N = len(caption)
         cur_idx = 0
         self.encoder.eval()
+        if self.encoder_ema is not None:
+            self.encoder_ema.eval()
         all_output = []
         while cur_idx < N:
             if cur_idx + batch_size >= N:
@@ -260,7 +443,13 @@ class DDPMTrainer(object):
             else:
                 batch_caption = caption[cur_idx: cur_idx + batch_size]
                 batch_m_lens = m_lens[cur_idx: cur_idx + batch_size]
-            output = self.generate_batch(batch_caption, batch_m_lens, dim_pose)
+            output = self.generate_batch(
+                batch_caption,
+                batch_m_lens,
+                dim_pose,
+                guidance_scale=float(getattr(self.opt, "cfg_scale", 4.5)),
+                model=model_to_use,
+            )
             B = output.shape[0]
 
             for i in range(B):
@@ -903,6 +1092,3 @@ class DDPMTrainer(object):
             self.save(pjoin(self.opt.model_dir, 'latest.tar'), epoch, it)
             
             print(f" Epoch {epoch} completed successfully. Time elapsed: {(time.time() - start_time)/60:.2f} mins.")
-
-# PYTHONPATH=. /srv/conda/envs/serverai/motiondiff/bin/python -u tools/train.py --name beat_kendall_sinkhorn --dataset_name beat --use_velocity_loss --use_acceleration_loss --use_geometric_loss --use_fk_loss --use_min_snr_weighting --use_uncertainty_weighting --use_sinkhorn_geom_loss --sinkhorn_epsilon 0.05 --sinkhorn_iters 20 --sinkhorn_max_frames 1024 
-            

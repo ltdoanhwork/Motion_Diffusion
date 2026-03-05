@@ -1,0 +1,14 @@
+{
+  "parts": [
+    {
+      "text": "a person is running",
+      "indices": [0, 1, 2, 3, 4, 5],
+      "weight": 1.0
+    },
+    {
+      "text": "a person is waving left hand",
+      "indices": [180, 181, 182, 183, 184, 185],
+      "weight": 1.0
+    }
+  ]
+}
