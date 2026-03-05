@@ -81,6 +81,10 @@ class TrainCompOptions(BaseOptions):
                                  help='Number of Sinkhorn iterations')
         self.parser.add_argument('--sinkhorn_max_frames', type=int, default=2048,
                                  help='Max valid frames (B*T) used for Sinkhorn geometric loss; 0 means all')
+        self.parser.add_argument('--use_sobolev_training', action='store_true',
+                                 help='Enable Sobolev regularization term on temporal derivatives (H1/H2)')
+        self.parser.add_argument('--sobolev_stochastic', action='store_true',
+                                 help='Use stochastic Sobolev approximation via random directional projections')
         
         # ==================== Classifier-Free Guidance ====================
         self.parser.add_argument('--cfg_dropout', type=float, default=0.1,

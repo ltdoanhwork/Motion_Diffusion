@@ -66,6 +66,13 @@ class DDPMTrainer(object):
         self.sinkhorn_epsilon = float(getattr(args, "sinkhorn_epsilon", 0.05))
         self.sinkhorn_iters = int(getattr(args, "sinkhorn_iters", 20))
         self.sinkhorn_max_frames = int(getattr(args, "sinkhorn_max_frames", 2048))
+        self.use_sobolev_training = getattr(args, "use_sobolev_training", False)
+        self.sobolev_weight = float(getattr(args, "sobolev_weight", 0.0))
+        self.sobolev_lambda_h1 = float(getattr(args, "sobolev_lambda_h1", 1.0))
+        self.sobolev_lambda_h2 = float(getattr(args, "sobolev_lambda_h2", 1.0))
+        self.sobolev_order = int(getattr(args, "sobolev_order", 2))
+        self.sobolev_stochastic = getattr(args, "sobolev_stochastic", False)
+        self.sobolev_num_projections = int(getattr(args, "sobolev_num_projections", 1))
         self.init_log_sigma_diff = float(getattr(args, "init_log_sigma_diff", 0.0))
         self.init_log_sigma_vel = float(getattr(args, "init_log_sigma_vel", 0.0))
         self.init_log_sigma_acc = float(getattr(args, "init_log_sigma_acc", 0.0))
@@ -74,6 +81,7 @@ class DDPMTrainer(object):
             self.diffusion.alphas_cumprod, dtype=torch.float32, device=self.device
         )
         self._printed_geom_unit_info = False
+        self._last_geom_components = {}
 
         if self.use_uncertainty_weighting:
             self.log_sigma_diff = torch.nn.Parameter(torch.tensor(self.init_log_sigma_diff, device=self.device))
@@ -283,23 +291,43 @@ class DDPMTrainer(object):
         loss_acc = None
         loss_geom = None
         
-        # THÊM: Velocity Loss (giảm jitter)
+        # Velocity loss (H1 Sobolev term when enabled)
         if self.opt.use_velocity_loss:
             vel_gt = gt_motion[:, 1:] - gt_motion[:, :-1]
             vel_pred = pred_motion[:, 1:] - pred_motion[:, :-1]
             vel_mask = (src_mask[:, 1:] * src_mask[:, :-1]).unsqueeze(-1)  # (B, T-1, 1)
-            vel_sq = self.mse_criterion(vel_pred, vel_gt) * vel_mask
-            denom_vel = vel_mask.sum() * vel_pred.shape[-1] + 1e-8
-            loss_vel = vel_sq.sum() / denom_vel
+            use_stochastic_sobolev = self.use_sobolev_training and self.sobolev_stochastic
+            if use_stochastic_sobolev:
+                vel_valid = vel_mask.expand_as(vel_pred) > 0.5
+                if vel_valid.any():
+                    vel_pred_valid = vel_pred[vel_valid].view(-1, vel_pred.shape[-1])
+                    vel_gt_valid = vel_gt[vel_valid].view(-1, vel_gt.shape[-1])
+                    loss_vel = self._random_projection_mse(vel_pred_valid, vel_gt_valid)
+                else:
+                    loss_vel = torch.tensor(0.0, device=pred_motion.device, dtype=pred_motion.dtype)
+            else:
+                vel_sq = self.mse_criterion(vel_pred, vel_gt) * vel_mask
+                denom_vel = vel_mask.sum() * vel_pred.shape[-1] + 1e-8
+                loss_vel = vel_sq.sum() / denom_vel
         
-        # THÊM: Acceleration Loss (motion smoother)
+        # Acceleration loss (H2 Sobolev term when enabled)
         if self.opt.use_acceleration_loss and loss_vel is not None:
             acc_gt = vel_gt[:, 1:] - vel_gt[:, :-1]
             acc_pred = vel_pred[:, 1:] - vel_pred[:, :-1]
             acc_mask = (vel_mask[:, 1:] * vel_mask[:, :-1])  # (B, T-2, 1)
-            acc_sq = self.mse_criterion(acc_pred, acc_gt) * acc_mask
-            denom_acc = acc_mask.sum() * acc_pred.shape[-1] + 1e-8
-            loss_acc = acc_sq.sum() / denom_acc
+            use_stochastic_sobolev = self.use_sobolev_training and self.sobolev_stochastic
+            if use_stochastic_sobolev:
+                acc_valid = acc_mask.expand_as(acc_pred) > 0.5
+                if acc_valid.any():
+                    acc_pred_valid = acc_pred[acc_valid].view(-1, acc_pred.shape[-1])
+                    acc_gt_valid = acc_gt[acc_valid].view(-1, acc_gt.shape[-1])
+                    loss_acc = self._random_projection_mse(acc_pred_valid, acc_gt_valid)
+                else:
+                    loss_acc = torch.tensor(0.0, device=pred_motion.device, dtype=pred_motion.dtype)
+            else:
+                acc_sq = self.mse_criterion(acc_pred, acc_gt) * acc_mask
+                denom_acc = acc_mask.sum() * acc_pred.shape[-1] + 1e-8
+                loss_acc = acc_sq.sum() / denom_acc
         
         # THÊM: Geometric Loss (Bone length consistency)
         if self.opt.use_geometric_loss:
@@ -369,6 +397,10 @@ class DDPMTrainer(object):
             loss_logs['loss_acc'] = loss_acc.item()
         if self.opt.use_geometric_loss:
             loss_logs['loss_geom'] = loss_geom.item()
+            if self._last_geom_components:
+                loss_logs['loss_dir'] = self._last_geom_components.get('loss_dir', torch.tensor(0.0, device=self.device)).item()
+                loss_logs['loss_len'] = self._last_geom_components.get('loss_len', torch.tensor(0.0, device=self.device)).item()
+                loss_logs['loss_fk'] = self._last_geom_components.get('loss_fk', torch.tensor(0.0, device=self.device)).item()
         if self.use_uncertainty_weighting:
             loss_logs['sigma_diff'] = torch.exp(self.log_sigma_diff).item()
             loss_logs['sigma_vel'] = torch.exp(self.log_sigma_vel).item()
@@ -384,6 +416,72 @@ class DDPMTrainer(object):
             loss_logs['contrib_geom_total'] = contrib_geom_total.item()
         
         return loss_logs
+
+    def _random_projection_mse(self, a, b):
+        """
+        Stochastic Sobolev approximation:
+        compare random directional projections instead of full Jacobian-like tensors.
+        a, b: (..., D)
+        """
+        D = a.shape[-1]
+        n_proj = max(self.sobolev_num_projections, 1)
+        total = torch.tensor(0.0, device=a.device, dtype=a.dtype)
+        for _ in range(n_proj):
+            v = torch.randn(D, device=a.device, dtype=a.dtype)
+            v = v / (torch.norm(v) + 1e-8)
+            proj_a = torch.matmul(a, v)
+            proj_b = torch.matmul(b, v)
+            total = total + ((proj_a - proj_b) ** 2).mean()
+        return total / n_proj
+
+    def compute_sobolev_loss(self, motion_pred, motion_gt, src_mask=None):
+        """
+        Sobolev regularization (H1/H2) over temporal derivatives:
+        L_sob = lambda1 * ||d_t xhat - d_t x||^2 + lambda2 * ||d_tt xhat - d_tt x||^2
+        Supports stochastic directional approximation.
+        """
+        if src_mask is None:
+            src_mask = torch.ones(
+                motion_pred.shape[0],
+                motion_pred.shape[1],
+                device=motion_pred.device,
+                dtype=motion_pred.dtype,
+            )
+        else:
+            src_mask = src_mask.to(device=motion_pred.device, dtype=motion_pred.dtype)
+
+        vel_gt = motion_gt[:, 1:] - motion_gt[:, :-1]
+        vel_pred = motion_pred[:, 1:] - motion_pred[:, :-1]
+        vel_mask = (src_mask[:, 1:] * src_mask[:, :-1]).unsqueeze(-1)
+        vel_valid = vel_mask.expand_as(vel_pred) > 0.5
+
+        if vel_valid.any():
+            vel_pred_valid = vel_pred[vel_valid].view(-1, vel_pred.shape[-1])
+            vel_gt_valid = vel_gt[vel_valid].view(-1, vel_gt.shape[-1])
+            if self.sobolev_stochastic:
+                h1 = self._random_projection_mse(vel_pred_valid, vel_gt_valid)
+            else:
+                h1 = F.mse_loss(vel_pred_valid, vel_gt_valid)
+        else:
+            h1 = torch.tensor(0.0, device=motion_pred.device, dtype=motion_pred.dtype)
+
+        total = self.sobolev_lambda_h1 * h1
+        if self.sobolev_order >= 2:
+            acc_gt = vel_gt[:, 1:] - vel_gt[:, :-1]
+            acc_pred = vel_pred[:, 1:] - vel_pred[:, :-1]
+            acc_mask = vel_mask[:, 1:] * vel_mask[:, :-1]
+            acc_valid = acc_mask.expand_as(acc_pred) > 0.5
+            if acc_valid.any():
+                acc_pred_valid = acc_pred[acc_valid].view(-1, acc_pred.shape[-1])
+                acc_gt_valid = acc_gt[acc_valid].view(-1, acc_gt.shape[-1])
+                if self.sobolev_stochastic:
+                    h2 = self._random_projection_mse(acc_pred_valid, acc_gt_valid)
+                else:
+                    h2 = F.mse_loss(acc_pred_valid, acc_gt_valid)
+            else:
+                h2 = torch.tensor(0.0, device=motion_pred.device, dtype=motion_pred.dtype)
+            total = total + self.sobolev_lambda_h2 * h2
+        return total
 
     def _denormalize_motion(self, motion):
         if self.motion_mean is None or self.motion_std is None:
@@ -463,35 +561,40 @@ class DDPMTrainer(object):
         bone_len_pred = torch.norm(bone_pred, dim=-1, keepdim=True) + 1e-6
         bone_len_gt = torch.norm(bone_gt, dim=-1, keepdim=True) + 1e-6
 
-        # Quick fix: auto-check unit scale and convert mm -> m if needed.
-        # Typical human bone length in mm is often >100; in meters it's <2.
-        median_bone_len = torch.median(bone_len_gt.detach())
-        if median_bone_len > 100.0:
-            positions_pred = positions_pred * 0.001
-            positions_gt = positions_gt * 0.001
-            bone_pred = bone_pred * 0.001
-            bone_gt = bone_gt * 0.001
-            bone_len_pred = bone_len_pred * 0.001
-            bone_len_gt = bone_len_gt * 0.001
-            if not self._printed_geom_unit_info:
-                print("[INFO] Geometric/FK: detected mm-scale joints, converted to meters (x0.001).")
-                self._printed_geom_unit_info = True
-        elif not self._printed_geom_unit_info:
-            print("[INFO] Geometric/FK: joint scale does not look like mm; keep original unit.")
+        # BEAT offsets are in centimeters: force cm -> m to stabilize FK/geometric scale.
+        scale_factor = 0.01
+        positions_pred = positions_pred * scale_factor
+        positions_gt = positions_gt * scale_factor
+        bone_pred = bone_pred * scale_factor
+        bone_gt = bone_gt * scale_factor
+        bone_len_pred = bone_len_pred * scale_factor
+        bone_len_gt = bone_len_gt * scale_factor
+        if not self._printed_geom_unit_info:
+            print("[INFO] Geometric/FK: converted BEAT joint scale from cm to m (x0.01).")
             self._printed_geom_unit_info = True
-
+        
         # Optional: Sinkhorn divergence geometric loss (distribution-wise on point clouds).
         if self.use_sinkhorn_geom_loss:
             valid_idx = (src_mask > 0.5).reshape(-1)
             pred_clouds = positions_pred.reshape(-1, n_joints, 3)[valid_idx]
             gt_clouds = positions_gt.reshape(-1, n_joints, 3)[valid_idx]
             if pred_clouds.shape[0] == 0:
+                self._last_geom_components = {
+                    'loss_dir': torch.tensor(0.0, device=motion_pred.device, dtype=motion_pred.dtype),
+                    'loss_len': torch.tensor(0.0, device=motion_pred.device, dtype=motion_pred.dtype),
+                    'loss_fk': torch.tensor(0.0, device=motion_pred.device, dtype=motion_pred.dtype),
+                }
                 return torch.tensor(0.0, device=motion_pred.device, dtype=motion_pred.dtype)
             if self.sinkhorn_max_frames > 0 and pred_clouds.shape[0] > self.sinkhorn_max_frames:
                 perm = torch.randperm(pred_clouds.shape[0], device=pred_clouds.device)[:self.sinkhorn_max_frames]
                 pred_clouds = pred_clouds[perm]
                 gt_clouds = gt_clouds[perm]
             sinkhorn_vals = self._sinkhorn_divergence(pred_clouds, gt_clouds)
+            self._last_geom_components = {
+                'loss_dir': torch.tensor(0.0, device=motion_pred.device, dtype=motion_pred.dtype),
+                'loss_len': torch.tensor(0.0, device=motion_pred.device, dtype=motion_pred.dtype),
+                'loss_fk': sinkhorn_vals.mean(),
+            }
             return sinkhorn_vals.mean()
 
         # --- Classical geometric/FK loss path ---
@@ -515,53 +618,21 @@ class DDPMTrainer(object):
         len_per_bone = torch.abs(bone_len_pred - bone_len_gt).squeeze(-1)
         len_per_frame = len_per_bone.mean(dim=-1)
         len_loss = (len_per_frame * src_mask).sum() / valid_frames
-        
+        self._last_geom_components = {
+            'loss_dir': dir_loss,
+            'loss_len': len_loss,
+            'loss_fk': fk_loss,
+        }
         return dir_loss + len_loss + fk_loss
 
     def recover_root_translation(self, motion_data):
         """
-        Khôi phục Global Position từ Velocity features.
-        Mapping dựa trên Text2MotionDataset:
-        - Index 0: Root Angular Velocity (Y-axis)
-        - Index 1: Root Linear Velocity X (Local)
-        - Index 2: Root Linear Velocity Z (Local)
-        - Index 3: Root Height (Absolute Y)
+        Recover root translation for FK.
+        For BEAT axis-angle representation, root translation channels are not
+        explicitly available in the motion vector, so we keep root fixed at origin.
         """
-        # motion_data shape: (B, T, D)
-        
-        # 1. Tách dữ liệu
-        r_rot_vel = motion_data[:, :, 0]      # (B, T)
-        r_linear_vel = motion_data[:, :, 1:3] # (B, T, 2) -> (Vel_X, Vel_Z)
-        r_y = motion_data[:, :, 3:4]          # (B, T, 1) -> Height
-        
-        # 2. Tính hướng mặt (Heading Angle) - Tích phân vận tốc góc
-        # cumsum theo thời gian (dim=1)
-        root_rot_angle = torch.cumsum(r_rot_vel, dim=1) # (B, T)
-        
-        # 3. Xoay vector vận tốc Local (X, Z) sang Global
-        # Công thức xoay 2D:
-        # x_global = x_local * cos(a) - z_local * sin(a)
-        # z_global = x_local * sin(a) + z_local * cos(a)
-        
-        c = torch.cos(root_rot_angle)
-        s = torch.sin(root_rot_angle)
-        
-        global_linear_vel = torch.zeros_like(r_linear_vel)
-        global_linear_vel[:, :, 0] = r_linear_vel[:, :, 0] * c - r_linear_vel[:, :, 1] * s
-        global_linear_vel[:, :, 1] = r_linear_vel[:, :, 0] * s + r_linear_vel[:, :, 1] * c
-        
-        # 4. Tính vị trí X, Z bằng cách cộng dồn (Tích phân)
-        root_pos_xz = torch.cumsum(global_linear_vel, dim=1) # (B, T, 2)
-        
-        # 5. Ghép lại thành (X, Y, Z)
-        # Lưu ý thứ tự trục của hệ tọa độ (thường là X, Y, Z)
-        root_positions = torch.cat([
-            root_pos_xz[:, :, 0:1],  # Global X
-            r_y,                     # Global Y (Height có sẵn, không cần tích phân)
-            root_pos_xz[:, :, 1:2]   # Global Z
-        ], dim=-1) # (B, T, 3)
-        
-        return root_positions.unsqueeze(2) # (B, T, 1, 3) để khớp shape khớp xương
+        B, T, _ = motion_data.shape
+        return torch.zeros((B, T, 1, 3), device=motion_data.device, dtype=motion_data.dtype)
 
     def forward_kinematics(self, rot6d, motion_raw=None):
         """
@@ -582,7 +653,7 @@ class DDPMTrainer(object):
         global_rot_mats = [None] * n_joints
         positions = [None] * n_joints
 
-        # Root (Hips)
+        # Root (Hips): fixed at origin for BEAT axis-angle path.
         if motion_raw is not None:
             root_pos = self.recover_root_translation(motion_raw)  # (B, T, 1, 3)
             positions[0] = root_pos.squeeze(2)
@@ -833,5 +904,5 @@ class DDPMTrainer(object):
             
             print(f" Epoch {epoch} completed successfully. Time elapsed: {(time.time() - start_time)/60:.2f} mins.")
 
-            # PYTHONPATH=. /srv/conda/envs/serverai/motiondiff/bin/python -u tools/train.py --name beat_kendall_sinkhorn --dataset_name beat --use_velocity_loss --use_acceleration_loss --use_geometric_loss --use_fk_loss --use_min_snr_weighting --use_uncertainty_weighting --use_sinkhorn_geom_loss --sinkhorn_epsilon 0.05 --sinkhorn_iters 20 --sinkhorn_max_frames 1024 
+# PYTHONPATH=. /srv/conda/envs/serverai/motiondiff/bin/python -u tools/train.py --name beat_kendall_sinkhorn --dataset_name beat --use_velocity_loss --use_acceleration_loss --use_geometric_loss --use_fk_loss --use_min_snr_weighting --use_uncertainty_weighting --use_sinkhorn_geom_loss --sinkhorn_epsilon 0.05 --sinkhorn_iters 20 --sinkhorn_max_frames 1024 
             
