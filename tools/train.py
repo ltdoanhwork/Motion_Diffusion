@@ -2,6 +2,12 @@
 import numpy as np, torch
 from os.path import join as pjoin
 import os, sys
+import argparse
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -17,6 +23,67 @@ from models   import MotionTransformer
 from trainers import DDPMTrainer
 from datasets import Beat2MotionDataset  # t2m / kit
 from datasets.dataset import Text2MotionDataset
+
+# -----------------------------------------------------------
+# config helper
+# -----------------------------------------------------------
+def _to_cli_args_from_yaml(cfg):
+    if not isinstance(cfg, dict):
+        raise ValueError("YAML config must be a mapping/dictionary at top level.")
+
+    cli_args = []
+    args_map = cfg.get("args", {})
+    flags_map = cfg.get("flags", {})
+
+    if args_map is not None:
+        if not isinstance(args_map, dict):
+            raise ValueError("Field 'args' in YAML must be a mapping/dictionary.")
+        for key, value in args_map.items():
+            opt = f"--{key}"
+            if isinstance(value, bool):
+                if value:
+                    cli_args.append(opt)
+                continue
+            if isinstance(value, list):
+                cli_args.append(opt)
+                cli_args.extend([str(v) for v in value])
+                continue
+            if value is None:
+                continue
+            cli_args.extend([opt, str(value)])
+
+    if flags_map is not None:
+        if not isinstance(flags_map, dict):
+            raise ValueError("Field 'flags' in YAML must be a mapping/dictionary.")
+        for key, enabled in flags_map.items():
+            if bool(enabled):
+                cli_args.append(f"--{key}")
+
+    return cli_args
+
+
+def _merge_config_into_argv(argv):
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", type=str, default=None)
+    pre_opt, remaining = pre_parser.parse_known_args(argv)
+
+    if not pre_opt.config:
+        return remaining
+
+    if yaml is None:
+        raise ImportError(
+            "PyYAML is required for --config support. Install with: pip install pyyaml"
+        )
+    if not os.path.exists(pre_opt.config):
+        raise FileNotFoundError(f"Config file not found: {pre_opt.config}")
+
+    with open(pre_opt.config, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+
+    cfg_args = _to_cli_args_from_yaml(cfg)
+    print(f"[INFO] Loaded config: {pre_opt.config}")
+    return cfg_args + remaining
+
 
 # -----------------------------------------------------------
 # helper
@@ -107,6 +174,9 @@ def check_data_shape(motion_dir):
 # main
 # -----------------------------------------------------------
 if __name__ == '__main__':
+    merged_argv = _merge_config_into_argv(sys.argv[1:])
+    sys.argv = [sys.argv[0]] + merged_argv
+
     parser = TrainCompOptions()
     opt    = parser.parse()
 

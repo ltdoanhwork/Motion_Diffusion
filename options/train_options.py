@@ -1,0 +1,134 @@
+from options.base_options import BaseOptions
+import argparse
+
+class TrainCompOptions(BaseOptions):
+    def initialize(self):
+        BaseOptions.initialize(self)
+        # ==================== Model Architecture ====================
+        self.parser.add_argument('--num_layers', type=int, default=8, help='num_layers of transformer')
+        self.parser.add_argument('--latent_dim', type=int, default=512, help='latent_dim of transformer')
+        self.parser.add_argument('--no_clip', action='store_true', help='whether use clip pretrain')
+        self.parser.add_argument('--no_eff', action='store_true', help='whether use efficient attention')
+
+        # ==================== Diffusion Settings ====================
+        self.parser.add_argument('--diffusion_steps', type=int, default=1000, help='diffusion_steps of transformer')
+        self.parser.add_argument('--beta_schedule', type=str, default='linear',
+                                 choices=['linear', 'cosine', 'scaled_linear'],
+                                 help='Beta schedule for diffusion process')
+        self.parser.add_argument('--prediction_type', type=str, default='v_prediction',
+                                 choices=['epsilon', 'v_prediction', 'x_start'],
+                                 help='What the model predicts (noise, v, or x0)')
+        
+        # ==================== Training Hyperparameters ====================
+        self.parser.add_argument('--num_epochs', type=int, default=50, help='Number of epochs')
+        self.parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
+        self.parser.add_argument('--batch_size', type=int, default=32, help='Batch size per GPU')
+        self.parser.add_argument('--times', type=int, default=1, help='times of dataset')
+        self.parser.add_argument('--feat_bias', type=float, default=25, help='Scales for global motion features and foot contact')
+        self.parser.add_argument('--test_ratio', type=float, default=0.1,
+                                 help='Split ratio for test.txt when auto-creating BEAT splits')
+        self.parser.add_argument('--split_seed', type=int, default=3407,
+                                 help='Random seed used for train/test split generation')
+        
+        # ==================== Motion-Specific Losses ====================
+        self.parser.add_argument('--use_velocity_loss', action='store_true',
+                                 help='Use velocity matching loss for temporal smoothness')
+        self.parser.add_argument('--use_acceleration_loss', action='store_true',
+                                 help='Use acceleration matching loss for motion dynamics')
+        self.parser.add_argument('--use_geometric_loss', action='store_true',
+                                 help='Use geometric consistency loss (bone length)')
+        self.parser.add_argument('--use_fk_loss', action='store_true',
+                                 help='Use forward kinematics (FK) loss for global position accuracy')
+        self.parser.add_argument('--velocity_weight', type=float, default=0.5,
+                                 help='Weight for velocity loss')
+        self.parser.add_argument('--acceleration_weight', type=float, default=0.1,
+                                 help='Weight for acceleration loss')
+        self.parser.add_argument('--geometric_weight', type=float, default=0.3,
+                                 help='Weight for geometric loss')
+        self.parser.add_argument('--fk_weight', type=float, default=1.0,
+                                 help='Weight for forward kinematics (FK) loss')
+
+        # ==================== Training Improvements ====================
+        self.parser.add_argument('--ema_decay', type=float, default=0.9999,
+                                 help='EMA decay rate for model weights (0 to disable)')
+        self.parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
+                                 help='Number of gradient accumulation steps')
+        self.parser.add_argument('--use_amp', action='store_true',
+                                 help='Use automatic mixed precision training')
+        self.parser.add_argument('--max_grad_norm', type=float, default=1.0,
+                                 help='Maximum gradient norm for clipping')
+        
+        self.parser.add_argument('--use_min_snr_weighting', action='store_true',
+                                 help='Apply Min-SNR weighting to diffusion reconstruction loss')
+        self.parser.add_argument('--min_snr_gamma', type=float, default=5.0,
+                                 help='Clamp value gamma for Min-SNR weighting: w_t=min(SNR(t), gamma)')
+        self.parser.add_argument('--use_uncertainty_weighting', action='store_true',
+                                 help='Use Kendall uncertainty weighting across active loss terms')
+        self.parser.add_argument('--uncertainty_lr_scale', type=float, default=10.0,
+                                 help='LR multiplier for uncertainty parameters (log_sigma_*)')
+        self.parser.add_argument('--init_log_sigma_diff', type=float, default=0.0,
+                                 help='Initial value for log_sigma_diff when uncertainty weighting is enabled')
+        self.parser.add_argument('--init_log_sigma_vel', type=float, default=0.0,
+                                 help='Initial value for log_sigma_vel when uncertainty weighting is enabled')
+        self.parser.add_argument('--init_log_sigma_acc', type=float, default=0.0,
+                                 help='Initial value for log_sigma_acc when uncertainty weighting is enabled')
+        self.parser.add_argument('--init_log_sigma_geom', type=float, default=0.0,
+                                 help='Initial value for log_sigma_geom when uncertainty weighting is enabled')
+        self.parser.add_argument('--use_sinkhorn_geom_loss', action='store_true',
+                                 help='Use Sinkhorn divergence as geometric loss instead of point-wise geometric/FK loss')
+        self.parser.add_argument('--sinkhorn_epsilon', type=float, default=0.05,
+                                 help='Entropic regularization epsilon for Sinkhorn divergence')
+        self.parser.add_argument('--sinkhorn_iters', type=int, default=20,
+                                 help='Number of Sinkhorn iterations')
+        self.parser.add_argument('--sinkhorn_max_frames', type=int, default=2048,
+                                 help='Max valid frames (B*T) used for Sinkhorn geometric loss; 0 means all')
+        self.parser.add_argument('--use_sobolev_training', action='store_true',
+                                 help='Enable Sobolev regularization term on temporal derivatives (H1/H2)')
+        self.parser.add_argument('--sobolev_stochastic', action='store_true',
+                                 help='Use stochastic Sobolev approximation via random directional projections')
+        
+        # ==================== Classifier-Free Guidance ====================
+        self.parser.add_argument('--cfg_dropout', type=float, default=0.1,
+                                 help='Probability to drop text condition for CFG training')
+        self.parser.add_argument('--cfg_scale', type=float, default=4.5,
+                                 help='CFG scale for inference (1.0 = no guidance)')
+        self.parser.add_argument('--use_guidance_scheduling', action='store_true',
+                                 help='Use timestep-dependent guidance scale during inference')
+        self.parser.add_argument('--guidance_schedule_type', type=str, default='constant',
+                                 choices=['constant', 'sqrt_alpha', 'linear', 'sine'],
+                                 help='Guidance scale schedule type')
+        self.parser.add_argument('--use_inference_guidance', action='store_true',
+                                 help='Enable optional inference-time constraint guidance')
+        self.parser.add_argument('--inference_guidance_mode', type=str, default='temporal_smooth',
+                                 choices=['temporal_smooth'],
+                                 help='Type of inference-time guidance')
+        self.parser.add_argument('--inference_guidance_weight', type=float, default=0.0,
+                                 help='Strength of inference-time guidance')
+        self.parser.add_argument('--inference_sampler', type=str, default='ddpm',
+                                 choices=['ddpm', 'ddim', 'dpm_solverpp'],
+                                 help='Sampler used at inference time')
+        self.parser.add_argument('--ddim_eta', type=float, default=0.0,
+                                 help='DDIM eta (0.0 = deterministic)')
+        self.parser.add_argument('--dpm_solverpp_steps', type=int, default=20,
+                                 help='Target steps for DPM-Solver++ (if implementation is available)')
+        self.parser.add_argument('--enable_body_part_control', action='store_true',
+                                 help='Enable body part-independent controlling during inference sampling')
+        self.parser.add_argument('--body_part_control_config', type=str, default='',
+                                 help='Path to JSON config with body-part prompts and feature indices')
+        self.parser.add_argument('--body_part_lambda1', type=float, default=0.0,
+                                 help='Correction weight lambda1 for body-part noise interpolation')
+        self.parser.add_argument('--enable_time_varied_control', action='store_true',
+                                 help='Enable time-varied controlling during inference sampling')
+        self.parser.add_argument('--time_varied_control_config', type=str, default='',
+                                 help='Path to JSON config with interval prompts')
+        self.parser.add_argument('--time_varied_lambda2', type=float, default=0.0,
+                                 help='Correction weight lambda2 for time-varied noise interpolation')
+
+        # ==================== Checkpointing & Logging ====================
+        self.parser.add_argument('--is_continue', action="store_true", help='Is this trail continued from previous trail?')
+        self.parser.add_argument('--log_every', type=int, default=10, help='Frequency of printing training progress (by iteration)')
+        self.parser.add_argument('--save_every_e', type=int, default=5, help='Frequency of saving models (by epoch)')
+        self.parser.add_argument('--eval_every_e', type=int, default=5, help='Frequency of animation results (by epoch)')
+        self.parser.add_argument('--save_latest', type=int, default=1, help='Frequency of saving models (by iteration)')
+        
+        self.is_train = True

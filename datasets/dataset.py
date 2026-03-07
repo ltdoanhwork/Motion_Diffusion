@@ -244,6 +244,8 @@ class Beat2MotionDataset(Dataset):
                     motion_proc = motion_raw 
                 elif self.use_rep == 'axis_angle':
                     motion_proc = motion_raw
+                elif self.use_rep in ('rot6d', 'rotation_6d', '6d'):
+                    motion_proc = motion_raw
                 else:
                     raise ValueError(f"motion_rep '{self.use_rep}' không được hỗ trợ hoặc không khớp với dữ liệu .npy")
                 if motion_proc.ndim != 2 or motion_proc.shape[0] == 0 or motion_proc.shape[1] == 0:

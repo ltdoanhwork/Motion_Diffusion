@@ -4,6 +4,7 @@ import random
 import time
 import os
 import json
+import math
 import numpy as np
 from models.transformer import MotionTransformer
 from torch.utils.data import DataLoader
@@ -87,6 +88,14 @@ class DDPMTrainer(object):
         self.enable_time_varied_control = getattr(args, "enable_time_varied_control", False)
         self.body_part_lambda1 = float(getattr(args, "body_part_lambda1", 0.0))
         self.time_varied_lambda2 = float(getattr(args, "time_varied_lambda2", 0.0))
+        self.use_guidance_scheduling = getattr(args, "use_guidance_scheduling", False)
+        self.guidance_schedule_type = str(getattr(args, "guidance_schedule_type", "constant"))
+        self.use_inference_guidance = getattr(args, "use_inference_guidance", False)
+        self.inference_guidance_mode = str(getattr(args, "inference_guidance_mode", "temporal_smooth"))
+        self.inference_guidance_weight = float(getattr(args, "inference_guidance_weight", 0.0))
+        self.inference_sampler = str(getattr(args, "inference_sampler", "ddpm")).lower()
+        self.ddim_eta = float(getattr(args, "ddim_eta", 0.0))
+        self.dpm_solverpp_steps = int(getattr(args, "dpm_solverpp_steps", 20))
         self.body_part_control_config = self._load_control_config(
             getattr(args, "body_part_control_config", ""),
             expected_key="parts",
@@ -201,6 +210,41 @@ class DDPMTrainer(object):
                 return text_value * batch_size
         raise ValueError("Control text must be a string or list with length equal to batch size.")
 
+    def _get_guidance_scale_t(self, t, guidance_scale):
+        if not self.use_guidance_scheduling:
+            return torch.full_like(t, float(guidance_scale), dtype=torch.float32)
+
+        t_float = t.float()
+        max_t = max(int(self.diffusion_steps) - 1, 1)
+        if self.guidance_schedule_type == "sqrt_alpha":
+            idx = t.long().clamp(min=0, max=max_t)
+            alpha_bar_t = self.alphas_cumprod_t[idx].clamp(min=1e-8)
+            mult = torch.sqrt(alpha_bar_t)
+        elif self.guidance_schedule_type == "linear":
+            mult = t_float / float(max_t)
+        elif self.guidance_schedule_type == "sine":
+            mult = torch.sin(math.pi * t_float / float(max_t))
+        else:
+            mult = torch.ones_like(t_float)
+        return float(guidance_scale) * mult
+
+    def _apply_inference_guidance(self, x, pred):
+        if (not self.use_inference_guidance) or self.inference_guidance_weight == 0.0:
+            return pred
+        if self.inference_guidance_mode != "temporal_smooth":
+            return pred
+        if x.shape[1] < 3:
+            return pred
+        # Energy guidance with temporal smoothness prior: E = ||acc(x)||^2.
+        # We use -grad(E) as correction direction.
+        with torch.enable_grad():
+            x_var = x.detach().requires_grad_(True)
+            vel = x_var[:, 1:] - x_var[:, :-1]
+            acc = vel[:, 1:] - vel[:, :-1]
+            smooth_energy = (acc ** 2).mean()
+            grad = torch.autograd.grad(smooth_energy, x_var, retain_graph=False, create_graph=False)[0]
+        return pred - self.inference_guidance_weight * grad.detach()
+
     def _init_skeleton_data(self):
         """
         Hàm này chuẩn bị sẵn toàn bộ dữ liệu xương khớp lên GPU (self.device).
@@ -283,6 +327,8 @@ class DDPMTrainer(object):
         guidance_scale=4.5,
         body_part_control=None,
         time_varied_control=None,
+        inpaint_motion=None,
+        inpaint_mask=None,
         model=None,
     ):
         model = self._unwrap_model(self.encoder if model is None else model)
@@ -333,8 +379,10 @@ class DDPMTrainer(object):
             # Tách kết quả ra
             out_cond, out_uncond = torch.split(out_combined, B, dim=0)
             
-            # Công thức CFG
-            base_pred = out_uncond + guidance_scale * (out_cond - out_uncond)
+            scale_t = self._get_guidance_scale_t(t, guidance_scale).to(device=x.device, dtype=out_uncond.dtype)
+            scale_t = scale_t.view(B, *([1] * (out_uncond.dim() - 1)))
+            # CFG with optional timestep scheduling.
+            base_pred = out_uncond + scale_t * (out_cond - out_uncond)
 
             controlled_preds = []
 
@@ -353,7 +401,7 @@ class DDPMTrainer(object):
                         xf_proj=part_xf_proj,
                         xf_out=part_xf_out,
                     )
-                    guided_part = out_uncond + guidance_scale * (out_part - out_uncond)
+                    guided_part = out_uncond + scale_t * (out_part - out_uncond)
                     feat_mask = self._build_feature_mask(
                         part_cfg.get("indices"),
                         dim_pose=x.shape[-1],
@@ -390,7 +438,7 @@ class DDPMTrainer(object):
                         xf_proj=time_xf_proj,
                         xf_out=time_xf_out,
                     )
-                    guided_time = out_uncond + guidance_scale * (out_time - out_uncond)
+                    guided_time = out_uncond + scale_t * (out_time - out_uncond)
                     interval_mask = torch.zeros(1, T, 1, device=x.device, dtype=x.dtype)
                     interval_mask[:, start:end, :] = 1.0
                     padded_term = guided_time * interval_mask * interval_weight
@@ -408,23 +456,69 @@ class DDPMTrainer(object):
                     controlled_preds.append(time_pred)
 
             if controlled_preds:
-                return torch.stack(controlled_preds, dim=0).mean(dim=0)
-            return base_pred
+                final_pred = torch.stack(controlled_preds, dim=0).mean(dim=0)
+            else:
+                final_pred = base_pred
+            final_pred = self._apply_inference_guidance(x, final_pred)
+            return final_pred
 
         T = min(max(m_lens_list), model.num_frames)
 
-        # Gọi p_sample_loop
-        output = self.diffusion.p_sample_loop(
-            model_fn,
-            (B, T, dim_pose),
-            clip_denoised=False,
-            progress=True,
-            model_kwargs={
+        inpaint_motion_tensor = None
+        inpaint_mask_tensor = None
+        if inpaint_motion is not None:
+            if torch.is_tensor(inpaint_motion):
+                inpaint_motion_tensor = inpaint_motion.to(self.device).float()
+            else:
+                inpaint_motion_tensor = torch.tensor(inpaint_motion, device=self.device, dtype=torch.float32)
+            if inpaint_motion_tensor.dim() == 2:
+                inpaint_motion_tensor = inpaint_motion_tensor.unsqueeze(0)
+        if inpaint_mask is not None:
+            if torch.is_tensor(inpaint_mask):
+                inpaint_mask_tensor = inpaint_mask.to(self.device).float()
+            else:
+                inpaint_mask_tensor = torch.tensor(inpaint_mask, device=self.device, dtype=torch.float32)
+            if inpaint_mask_tensor.dim() == 2:
+                inpaint_mask_tensor = inpaint_mask_tensor.unsqueeze(0)
+
+        common_kwargs = {
+            'model_kwargs': {
                 'cond': {'xf_proj': xf_proj, 'xf_out': xf_out, 'length': m_lens_list},
                 'uncond': {'xf_proj': xf_proj_uncond, 'xf_out': xf_out_uncond, 'length': m_lens_list}
             },
-            device=self.device 
-        )
+            'device': self.device,
+            'progress': True,
+            'clip_denoised': False,
+        }
+        if self.inference_sampler == "ddpm":
+            output = self.diffusion.p_sample_loop(
+                model_fn,
+                (B, T, dim_pose),
+                inpaint_motion=inpaint_motion_tensor,
+                inpaint_mask=inpaint_mask_tensor,
+                **common_kwargs,
+            )
+        elif self.inference_sampler == "ddim":
+            if inpaint_motion_tensor is not None or inpaint_mask_tensor is not None:
+                print("[WARN] DDIM path currently ignores inpaint_motion/inpaint_mask; use inference_sampler=ddpm for inpainting.")
+            output = self.diffusion.ddim_sample_loop(
+                model_fn,
+                (B, T, dim_pose),
+                eta=self.ddim_eta,
+                **common_kwargs,
+            )
+        elif self.inference_sampler == "dpm_solverpp":
+            output = self.diffusion.dpm_solverpp_sample_loop(
+                model_fn,
+                (B, T, dim_pose),
+                num_inference_steps=self.dpm_solverpp_steps,
+                solver_order=2,
+                inpaint_motion=inpaint_motion_tensor,
+                inpaint_mask=inpaint_mask_tensor,
+                **common_kwargs,
+            )
+        else:
+            raise ValueError(f"Unknown inference_sampler: {self.inference_sampler}")
         
         return output
     
@@ -715,16 +809,22 @@ class DDPMTrainer(object):
 
     def compute_geometric_loss(self, motion_pred, motion_gt, src_mask=None):
         feat_dim = motion_pred.shape[-1]
-        if feat_dim % 3 != 0:
-            raise ValueError(f"Expected axis-angle feature dim divisible by 3, got {feat_dim}")
-        n_joints = feat_dim // 3
-        
-        motion_pred_reshaped = motion_pred.reshape(motion_pred.shape[0], motion_pred.shape[1], n_joints, 3)
-        motion_gt_reshaped = motion_gt.reshape(motion_gt.shape[0], motion_gt.shape[1], n_joints, 3)
-        
-        # Chuyển từ Axis-Angle (3D) sang 6D Rotation để thỏa mãn yêu cầu của forward_kinematics mới
-        motion_pred_6d = axis_angle_to_rotation_6d(motion_pred_reshaped)
-        motion_gt_6d = axis_angle_to_rotation_6d(motion_gt_reshaped)
+        rep = str(getattr(self.opt, "motion_rep", "axis_angle")).lower()
+        if rep in ("rot6d", "rotation_6d", "6d"):
+            if feat_dim % 6 != 0:
+                raise ValueError(f"Expected rot6d feature dim divisible by 6, got {feat_dim}")
+            n_joints = feat_dim // 6
+            motion_pred_6d = motion_pred.reshape(motion_pred.shape[0], motion_pred.shape[1], n_joints, 6)
+            motion_gt_6d = motion_gt.reshape(motion_gt.shape[0], motion_gt.shape[1], n_joints, 6)
+        else:
+            if feat_dim % 3 != 0:
+                raise ValueError(f"Expected axis-angle feature dim divisible by 3, got {feat_dim}")
+            n_joints = feat_dim // 3
+            motion_pred_reshaped = motion_pred.reshape(motion_pred.shape[0], motion_pred.shape[1], n_joints, 3)
+            motion_gt_reshaped = motion_gt.reshape(motion_gt.shape[0], motion_gt.shape[1], n_joints, 3)
+            # Chuyển từ Axis-Angle (3D) sang 6D Rotation để thỏa mãn yêu cầu của forward_kinematics mới
+            motion_pred_6d = axis_angle_to_rotation_6d(motion_pred_reshaped)
+            motion_gt_6d = axis_angle_to_rotation_6d(motion_gt_reshaped)
         
         positions_pred = self.forward_kinematics(motion_pred_6d, motion_raw=motion_pred) 
         positions_gt = self.forward_kinematics(motion_gt_6d, motion_raw=motion_gt)
@@ -980,8 +1080,10 @@ class DDPMTrainer(object):
         # Tính đúng T_max theo số optimizer steps (không phải micro-batches)
         steps_per_epoch = max(1, (len(train_loader) + grad_accum_steps - 1) // grad_accum_steps)
         total_steps = steps_per_epoch * self.opt.num_epochs
-        warmup_steps = min(500, steps_per_epoch)  # Warmup 1 epoch hoặc 500 optimizer steps
-        cosine_tmax = max(1, total_steps - warmup_steps)
+        # warmup_steps = min(500, steps_per_epoch) 
+        warmup_steps = int(0.05 * total_steps)
+        # cosine_tmax = max(1, total_steps - warmup_steps)
+        cosine_tmax = total_steps - warmup_steps
         
         warmup_scheduler = LinearLR(
             self.opt_encoder, 

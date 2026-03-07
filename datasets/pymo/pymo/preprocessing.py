@@ -167,16 +167,16 @@ class MocapParameterizer(BaseEstimator, TransformerMixin):
             titles = []
             euler_df = track.values
 
-            # Create a new DataFrame to store the exponential map rep
-            exp_df = pd.DataFrame(index=euler_df.index)
-
-            # Copy the root positions into the new DataFrame
+            # Build all output columns first, then create DataFrame once.
+            # This avoids pandas fragmentation warnings from repeated column inserts.
             rxp = '%s_Xposition'%track.root_name
             ryp = '%s_Yposition'%track.root_name
             rzp = '%s_Zposition'%track.root_name
-            exp_df[rxp] = pd.Series(data=euler_df[rxp], index=exp_df.index)
-            exp_df[ryp] = pd.Series(data=euler_df[ryp], index=exp_df.index)
-            exp_df[rzp] = pd.Series(data=euler_df[rzp], index=exp_df.index)
+            exp_cols = {
+                rxp: euler_df[rxp].to_numpy(),
+                ryp: euler_df[ryp].to_numpy(),
+                rzp: euler_df[rzp].to_numpy(),
+            }
             
             # List the columns that contain rotation channels
             rots = [c for c in euler_df.columns if ('rotation' in c and 'Nub' not in c)]
@@ -187,13 +187,21 @@ class MocapParameterizer(BaseEstimator, TransformerMixin):
             for joint in joints:
                 r = euler_df[[c for c in rots if joint in c]] # Get the columns that belong to this joint
                 euler = [[f[1]['%s_Xrotation'%joint], f[1]['%s_Yrotation'%joint], f[1]['%s_Zrotation'%joint]] for f in r.iterrows()] # Make sure the columsn are organized in xyz order
-                exps = [Rotation(f, 'euler', from_deg=True).to_expmap() for f in euler] # Convert the eulers to exp maps
+                if r.shape[1] >= 3:
+                    rotation_order = (
+                        r.columns[0][r.columns[0].find('rotation') - 1]
+                        + r.columns[1][r.columns[1].find('rotation') - 1]
+                        + r.columns[2][r.columns[2].find('rotation') - 1]
+                    )
+                else:
+                    rotation_order = 'XYZ'
+                exps = [Rotation(f, 'euler', rotation_order, from_deg=True).to_expmap() for f in euler] # Convert the eulers to exp maps
                 
-                # Create the corresponding columns in the new DataFrame
-    
-                exp_df['%s_alpha'%joint] = pd.Series(data=[e[0] for e in exps], index=exp_df.index)
-                exp_df['%s_beta'%joint] = pd.Series(data=[e[1] for e in exps], index=exp_df.index)
-                exp_df['%s_gamma'%joint] = pd.Series(data=[e[2] for e in exps], index=exp_df.index)
+                exp_cols['%s_alpha'%joint] = np.asarray([e[0] for e in exps], dtype=np.float64)
+                exp_cols['%s_beta'%joint] = np.asarray([e[1] for e in exps], dtype=np.float64)
+                exp_cols['%s_gamma'%joint] = np.asarray([e[2] for e in exps], dtype=np.float64)
+
+            exp_df = pd.DataFrame(exp_cols, index=euler_df.index)
 
             new_track = track.clone()
             new_track.values = exp_df

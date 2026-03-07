@@ -1,0 +1,100 @@
+profile: beat_kendall_sinkhorn
+description: BEAT Kendall + Sinkhorn training preset (copied from checkpoints/beat/beat_kendall_sinkhorn/opt.txt)
+
+script: tools/train.py
+command: >-
+  PYTHONPATH=. python -u tools/train.py
+  --name beat_kendall_sinkhorn
+  --dataset_name beat
+  --batch_size 32
+  --times 1
+  --num_epochs 50
+  --num_layers 8
+  --latent_dim 512
+  --diffusion_steps 1000
+  --beta_schedule linear
+  --prediction_type v_prediction
+  --lr 1e-4
+  --ema_decay 0.9999
+  --gradient_accumulation_steps 4
+  --max_grad_norm 1.0
+  --cfg_dropout 0.1
+  --cfg_scale 4.5
+  --log_every 10
+  --save_every_e 5
+  --eval_every_e 5
+  --save_latest 1
+  --test_ratio 0.1
+  --split_seed 3407
+  --velocity_weight 0.5
+  --acceleration_weight 0.1
+  --geometric_weight 0.3
+  --fk_weight 1.0
+  --min_snr_gamma 5.0
+  --uncertainty_lr_scale 10.0
+  --init_log_sigma_diff 0.0
+  --init_log_sigma_vel 0.0
+  --init_log_sigma_acc 0.0
+  --init_log_sigma_geom 0.0
+  --sinkhorn_epsilon 0.05
+  --sinkhorn_iters 20
+  --sinkhorn_max_frames 1024
+  --use_amp
+  --use_velocity_loss
+  --use_acceleration_loss
+  --use_geometric_loss
+  --use_fk_loss
+  --use_min_snr_weighting
+  --use_uncertainty_weighting
+  --use_sinkhorn_geom_loss
+  --motion_rep rot6d
+
+args:
+  name: beat_kendall_sinkhorn
+  dataset_name: beat
+  checkpoints_dir: ./checkpoints
+  batch_size: 32
+  times: 1
+  num_epochs: 50
+  num_layers: 8
+  latent_dim: 512
+  diffusion_steps: 1000
+  beta_schedule: linear
+  prediction_type: v_prediction
+  lr: 0.0001
+  ema_decay: 0.9999
+  gradient_accumulation_steps: 4
+  max_grad_norm: 1.0
+  cfg_dropout: 0.1
+  cfg_scale: 4.5
+  test_ratio: 0.1
+  split_seed: 3407
+  log_every: 10
+  save_every_e: 5
+  eval_every_e: 5
+  save_latest: 1
+  velocity_weight: 0.5
+  acceleration_weight: 0.1
+  geometric_weight: 0.3
+  fk_weight: 1.0
+  min_snr_gamma: 5.0
+  uncertainty_lr_scale: 10.0
+  init_log_sigma_diff: 0.0
+  init_log_sigma_vel: 0.0
+  init_log_sigma_acc: 0.0
+  init_log_sigma_geom: 0.0
+  sinkhorn_epsilon: 0.05
+  sinkhorn_iters: 20
+  sinkhorn_max_frames: 1024
+
+flags:
+  use_amp: true
+  use_velocity_loss: true
+  use_acceleration_loss: true
+  use_geometric_loss: true
+  use_fk_loss: true
+  use_min_snr_weighting: true
+  use_uncertainty_weighting: true
+  use_sinkhorn_geom_loss: true
+  use_sobolev_training: false
+  sobolev_stochastic: false

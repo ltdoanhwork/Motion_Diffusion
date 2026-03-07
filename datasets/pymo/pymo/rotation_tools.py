@@ -18,7 +18,7 @@ def rad2deg(x):
     return x/math.pi*180
 
 class Rotation():
-    def __init__(self,rot, param_type, rotation_order, **params):
+    def __init__(self, rot, param_type, rotation_order='XYZ', **params):
         self.rotmat = []
         self.rotation_order = rotation_order
         if param_type == 'euler':
@@ -29,7 +29,7 @@ class Rotation():
     def _from_euler(self, alpha, beta, gamma, params):
         '''Expecting degress'''
 
-        if params['from_deg']==True:
+        if params.get('from_deg', False) is True:
             alpha = deg2rad(alpha)
             beta = deg2rad(beta)
             gamma = deg2rad(gamma)
@@ -94,15 +94,42 @@ class Rotation():
 
     def get_euler_axis(self):
         R = self.rotmat
-        theta = math.acos((self.rotmat.trace() - 1) / 2)
-        axis = np.asarray([R[2,1] - R[1,2], R[0,2] - R[2,0], R[1,0] - R[0,1]])
-        axis = axis/(2*math.sin(theta))
+        # Robust axis-angle extraction from rotation matrix.
+        cos_theta = (float(np.trace(R)) - 1.0) / 2.0
+        cos_theta = max(-1.0, min(1.0, cos_theta))
+        theta = math.acos(cos_theta)
+
+        # Identity or very small rotation: axis is undefined, return zero vector.
+        if theta < 1e-8:
+            return 0.0, np.asarray([0.0, 0.0, 0.0], dtype=np.float64)
+
+        skew = np.asarray(
+            [R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]],
+            dtype=np.float64,
+        )
+        sin_theta = np.linalg.norm(skew) * 0.5
+
+        if sin_theta > 1e-8:
+            axis = skew / (2.0 * sin_theta)
+        else:
+            # Near pi, use diagonal fallback to avoid division by ~0.
+            diag = np.diag(R)
+            axis = np.sqrt(np.maximum((diag + 1.0) * 0.5, 0.0))
+            axis = np.asarray(axis, dtype=np.float64)
+            axis[0] = math.copysign(axis[0], R[2, 1] - R[1, 2])
+            axis[1] = math.copysign(axis[1], R[0, 2] - R[2, 0])
+            axis[2] = math.copysign(axis[2], R[1, 0] - R[0, 1])
+            n = np.linalg.norm(axis)
+            if n < 1e-8:
+                axis = np.asarray([1.0, 0.0, 0.0], dtype=np.float64)
+            else:
+                axis = axis / n
         return theta, axis
 
     def to_expmap(self):
         theta, axis = self.get_euler_axis()
         rot_arr = theta * axis
-        if np.isnan(rot_arr).any():
+        if not np.isfinite(rot_arr).all() or np.isnan(rot_arr).any():
             rot_arr = [0, 0, 0]
         return rot_arr
     
@@ -148,6 +175,4 @@ class Rotation():
     def __str__(self):
         return "Rotation Matrix: \n " + self.rotmat.__str__()
     
-
-
 

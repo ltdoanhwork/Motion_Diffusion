@@ -37,8 +37,14 @@ def get_opt(opt_path, device):
     with open(opt_path) as f:
         for line in f:
             if line.strip() not in skip:
-                # print(line.strip())
-                key, value = line.strip().split(': ')
+                line_clean = line.strip()
+                # Support empty values like "body_part_control_config:"
+                # and avoid crashing on malformed lines.
+                if ':' not in line_clean:
+                    continue
+                key, value = line_clean.split(':', 1)
+                key = key.strip()
+                value = value.strip()
                 if value in ('True', 'False'):
                     opt_dict[key] = True if value == 'True' else False
                 elif is_float(value):

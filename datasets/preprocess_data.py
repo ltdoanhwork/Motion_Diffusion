@@ -2,6 +2,7 @@ import sys
 import os
 import numpy as np
 import multiprocessing
+import torch
 from textgrid import TextGrid
 from sklearn.pipeline import Pipeline
 
@@ -12,12 +13,48 @@ if PYOM_DIR not in sys.path:
 from pymo.parsers import BVHParser
 from pymo.viz_tools import *
 from pymo.preprocessing import *
+from datasets.emage_utils.rotation_conversions import axis_angle_to_rotation_6d
 
 def time_to_frame(t, fps=60):  
     return int(round(t * fps))
 
+
+def axis_angle_numpy_to_rot6d(
+    motion_axis_angle: np.ndarray,
+    preserve_root_translation: bool = True,
+) -> np.ndarray:
+    """
+    Convert motion from axis-angle layout (T, J*3) to rotation-6d layout (T, J*6).
+    """
+    if motion_axis_angle.ndim != 2:
+        raise ValueError(
+            f"Expected 2D motion array, got {motion_axis_angle.shape}"
+        )
+    T, D = motion_axis_angle.shape
+    has_root_translation = False
+    root_trans = None
+
+    # Common BEAT expmap layout may include root translation at the first 3 dims.
+    if preserve_root_translation and D >= 6 and (D - 3) % 3 == 0:
+        has_root_translation = True
+        root_trans = motion_axis_angle[:, :3]
+        rot_part = motion_axis_angle[:, 3:]
+    elif D % 3 == 0:
+        rot_part = motion_axis_angle
+    else:
+        raise ValueError(
+            f"Expected axis-angle-like motion with D % 3 == 0 (or (D-3) % 3 == 0 with root translation), got {motion_axis_angle.shape}"
+        )
+
+    J = rot_part.shape[1] // 3
+    aa = torch.from_numpy(rot_part.astype(np.float32)).view(T, J, 3)
+    rot6d = axis_angle_to_rotation_6d(aa).reshape(T, J * 6).cpu().numpy()
+    if has_root_translation:
+        return np.concatenate([root_trans.astype(np.float32), rot6d], axis=1)
+    return rot6d
+
 def extract_sentences_with_text(textgrid_path, motion_data, output_dir, fps=30, pause_threshold=0.5,
-    split_parts=1, use_first_part_only=True
+    split_parts=1, use_first_part_only=True, output_rep='position'
 ):
     basename = os.path.splitext(os.path.basename(textgrid_path))[0]
     print(f"Processing {basename}, shape: {motion_data.shape}") 
@@ -33,6 +70,11 @@ def extract_sentences_with_text(textgrid_path, motion_data, output_dir, fps=30, 
     else:  
         motion = motion_data[0] if motion_data.ndim == 2 else motion_data  
       
+    if output_rep == 'rot6d':
+        motion = axis_angle_numpy_to_rot6d(motion)
+    elif output_rep not in ('position', 'axis_angle'):
+        raise ValueError(f"Unsupported output_rep: {output_rep}")
+
     max_frames = motion.shape[0]  
       
     tg = TextGrid.fromFile(textgrid_path)  
@@ -95,18 +137,30 @@ def extract_sentences_with_text(textgrid_path, motion_data, output_dir, fps=30, 
   
     print(f" Extracted {sentence_idx} sentences from {basename}")
 
-def preprocess_motion_data(base_dir, npy_out_dir, txt_out_dir):
+def preprocess_motion_data(base_dir, npy_out_dir, txt_out_dir, output_rep='position'):
     parser = BVHParser()
 
-    data_pipe = Pipeline([
-        ('param', MocapParameterizer('position')),
-        ('rcpn', RootCentricPositionNormalizer()),
-        ('delta', RootTransformer('absolute_translation_deltas')),
-        ('const', ConstantsRemover()),
-        ('np', Numpyfier()),
-        ('down', DownSampler(2)),
-        ('stdscale', ListStandardScaler())
-    ])
+    if output_rep == 'position':
+        data_pipe = Pipeline([
+            ('param', MocapParameterizer('position')),
+            ('rcpn', RootCentricPositionNormalizer()),
+            ('delta', RootTransformer('absolute_translation_deltas')),
+            ('const', ConstantsRemover()),
+            ('np', Numpyfier()),
+            ('down', DownSampler(2)),
+            ('stdscale', ListStandardScaler())
+        ])
+    elif output_rep in ('axis_angle', 'rot6d'):
+        # Use exponential map as axis-angle-like rotation features from BVH.
+        # rot6d branch is converted from this representation before saving.
+        data_pipe = Pipeline([
+            ('param', MocapParameterizer('expmap')),
+            ('np', Numpyfier()),
+            ('down', DownSampler(2)),
+            ('stdscale', ListStandardScaler())
+        ])
+    else:
+        raise ValueError(f"Unsupported output_rep: {output_rep}")
 
     if not os.path.exists(base_dir):
         print(f"Folder not found: {base_dir}")
@@ -132,7 +186,8 @@ def preprocess_motion_data(base_dir, npy_out_dir, txt_out_dir):
                 motion_data=piped_data,
                 output_dir=npy_out_dir,
                 split_parts=1,
-                use_first_part_only=True
+                use_first_part_only=True,
+                output_rep=output_rep,
             )
 
             for f in os.listdir(npy_out_dir):
@@ -157,7 +212,8 @@ def process_folder_wrapper(i):
         os.makedirs(npy_out_dir, exist_ok=True)
         os.makedirs(txt_out_dir, exist_ok=True)
         
-        preprocess_motion_data(base_dir, npy_out_dir, txt_out_dir)
+        output_rep = os.environ.get("BEAT_OUTPUT_REP", "position").strip().lower()
+        preprocess_motion_data(base_dir, npy_out_dir, txt_out_dir, output_rep=output_rep)
         
         print(f"<-- [Done] Finished folder {i}")
         return f"Folder {i}: Success"
@@ -169,7 +225,8 @@ def main():
     folder_indices = range(1, 31)
     
     num_workers = max(1, multiprocessing.cpu_count() - 2)
-    print(f"Using {num_workers} processes for {len(folder_indices)} folders.")
+    output_rep = os.environ.get("BEAT_OUTPUT_REP", "position").strip().lower()
+    print(f"Using {num_workers} processes for {len(folder_indices)} folders. output_rep={output_rep}")
 
     with multiprocessing.Pool(processes=num_workers) as pool:
         results = pool.map(process_folder_wrapper, folder_indices)
@@ -181,3 +238,4 @@ if __name__ == "__main__":
     main()
     print("=============================================================================================== ")
     print("Preprocessing completed.")
+# BEAT_OUTPUT_REP=rot6d PYTHONPATH=. /srv/conda/envs/serverai/motiondiff/bin/python datasets/preprocess_data.py

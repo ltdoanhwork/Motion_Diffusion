@@ -870,6 +870,8 @@ class GaussianDiffusion:
         cond_fn=None,
         pre_seq=None,
         transl_req=None,
+        inpaint_motion=None,
+        inpaint_mask=None,
         model_kwargs=None,
     ):
         """
@@ -903,6 +905,18 @@ class GaussianDiffusion:
                 x_t = self.q_sample(transl, t, noise=noise)
                 x[:, :2, item[0]] = x_t
 
+        mask = None
+        known = None
+        known_xt = None
+        if inpaint_motion is not None and inpaint_mask is not None:
+            known = inpaint_motion.to(device=x.device, dtype=x.dtype)
+            mask = inpaint_mask.to(device=x.device, dtype=x.dtype)
+            while mask.dim() < x.dim():
+                mask = mask.unsqueeze(-1)
+            noise = th.randn_like(known)
+            known_xt = self.q_sample(known, t, noise=noise)
+            x = mask * known_xt + (1.0 - mask) * x
+
         out = self.p_mean_variance(
             model,
             x,
@@ -920,6 +934,9 @@ class GaussianDiffusion:
                 cond_fn, out, x, t, model_kwargs=model_kwargs
             )
         sample = out["mean"] + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise
+        if mask is not None and known_xt is not None:
+            sample = mask * known_xt + (1.0 - mask) * sample
+            out["pred_xstart"] = mask * known + (1.0 - mask) * out["pred_xstart"]
         return {"sample": sample, "pred_xstart": out["pred_xstart"]}
 
     def p_sample_loop(
@@ -934,6 +951,8 @@ class GaussianDiffusion:
         device=None,
         pre_seq=None,
         transl_req=None,
+        inpaint_motion=None,
+        inpaint_mask=None,
         progress=False,
     ):
         """
@@ -967,6 +986,8 @@ class GaussianDiffusion:
             device=device,
             pre_seq=pre_seq,
             transl_req=transl_req,
+            inpaint_motion=inpaint_motion,
+            inpaint_mask=inpaint_mask,
             progress=progress,
         ):
             final = sample
@@ -984,6 +1005,8 @@ class GaussianDiffusion:
         device=None,
         pre_seq=None,
         transl_req=None,
+        inpaint_motion=None,
+        inpaint_mask=None,
         progress=False,
     ):
         """
@@ -1020,7 +1043,9 @@ class GaussianDiffusion:
                     cond_fn=cond_fn,
                     model_kwargs=model_kwargs,
                     pre_seq=pre_seq,
-                    transl_req=transl_req
+                    transl_req=transl_req,
+                    inpaint_motion=inpaint_motion,
+                    inpaint_mask=inpaint_mask,
                 )
                 yield out
                 img = out["sample"]
@@ -1196,6 +1221,103 @@ class GaussianDiffusion:
                 )
                 yield out
                 img = out["sample"]
+
+    def dpm_solverpp_sample_loop(
+        self,
+        model,
+        shape,
+        noise=None,
+        clip_denoised=True,
+        denoised_fn=None,
+        cond_fn=None,
+        model_kwargs=None,
+        device=None,
+        progress=False,
+        num_inference_steps=20,
+        solver_order=2,
+        inpaint_motion=None,
+        inpaint_mask=None,
+    ):
+        """
+        Generate samples with DPM-Solver++ (via diffusers backend).
+        This is an inference-only solver and does not affect training.
+        """
+        if cond_fn is not None:
+            raise NotImplementedError("cond_fn is not supported in dpm_solverpp_sample_loop.")
+        if denoised_fn is not None:
+            raise NotImplementedError("denoised_fn is not supported in dpm_solverpp_sample_loop.")
+
+        try:
+            from diffusers import DPMSolverMultistepScheduler
+        except Exception as exc:
+            raise ImportError(
+                "DPM-Solver++ backend requires `diffusers`. "
+                "Install it in your environment, e.g. `pip install diffusers`."
+            ) from exc
+
+        if device is None:
+            device = next(model.parameters()).device
+        assert isinstance(shape, (tuple, list))
+        if noise is not None:
+            img = noise.to(device)
+        else:
+            img = th.randn(*shape, device=device)
+
+        if model_kwargs is None:
+            model_kwargs = {}
+
+        prediction_type = {
+            ModelMeanType.EPSILON: "epsilon",
+            ModelMeanType.VELOCITY: "v_prediction",
+            ModelMeanType.START_X: "sample",
+        }.get(self.model_mean_type, None)
+        if prediction_type is None:
+            raise NotImplementedError(
+                f"DPM-Solver++ currently supports EPSILON/VELOCITY/START_X. Got {self.model_mean_type}."
+            )
+
+        scheduler = DPMSolverMultistepScheduler(
+            num_train_timesteps=self.num_timesteps,
+            trained_betas=self.betas,
+            prediction_type=prediction_type,
+            algorithm_type="dpmsolver++",
+            solver_order=int(max(1, solver_order)),
+        )
+        scheduler.set_timesteps(int(max(1, num_inference_steps)), device=device)
+
+        mask = None
+        known = None
+        if inpaint_motion is not None and inpaint_mask is not None:
+            known = inpaint_motion.to(device=device, dtype=img.dtype)
+            mask = inpaint_mask.to(device=device, dtype=img.dtype)
+            while mask.dim() < img.dim():
+                mask = mask.unsqueeze(-1)
+
+        timesteps = scheduler.timesteps
+        if progress:
+            from tqdm.auto import tqdm
+            timesteps = tqdm(timesteps)
+
+        for t in timesteps:
+            t_batch = th.full((shape[0],), int(t), device=device, dtype=th.long)
+
+            if mask is not None and known is not None:
+                known_noise = th.randn_like(known)
+                known_t = scheduler.add_noise(known, known_noise, t_batch)
+                img = mask * known_t + (1.0 - mask) * img
+
+            model_in = scheduler.scale_model_input(img, t)
+            model_out = model(model_in, self._scale_timesteps(t_batch), **model_kwargs)
+            img = scheduler.step(model_out, t, img).prev_sample
+
+            if mask is not None and known is not None:
+                known_noise = th.randn_like(known)
+                known_t = scheduler.add_noise(known, known_noise, t_batch)
+                img = mask * known_t + (1.0 - mask) * img
+
+        if clip_denoised:
+            img = img.clamp(-1, 1)
+        return img
 
     def _vb_terms_bpd(
         self, model, x_start, x_t, t, clip_denoised=True, model_kwargs=None
