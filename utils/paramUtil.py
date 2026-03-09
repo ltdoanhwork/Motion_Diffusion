@@ -180,3 +180,29 @@ beat_bone_pairs = [
 
 # (parent, child, local_offset_xyz)
 beat_skeleton_tree = [(p, c, beat_raw_offsets[c].tolist()) for p, c in beat_bone_pairs]
+
+
+# ---------------------------------------------------------------------------
+# BEAT-75 profile (drop 13 terminal "_Nub" joints from BEAT-88)
+# ---------------------------------------------------------------------------
+# This profile is used by datasets whose pose feature corresponds to 75 joints
+# (e.g., 75*6 or 3+75*6 for rot6d with optional root translation).
+beat75_removed_joint_indices = [9, 18, 24, 30, 36, 41, 50, 56, 62, 68, 73, 80, 87]
+_beat75_removed_joint_index_set = set(beat75_removed_joint_indices)
+beat75_keep_joint_indices = [i for i in range(len(beat_raw_offsets)) if i not in _beat75_removed_joint_index_set]
+beat75_old_to_new_index = {old_idx: new_idx for new_idx, old_idx in enumerate(beat75_keep_joint_indices)}
+beat75_raw_offsets = beat_raw_offsets[beat75_keep_joint_indices].copy()
+beat75_bone_pairs = [
+    (beat75_old_to_new_index[p], beat75_old_to_new_index[c])
+    for p, c in beat_bone_pairs
+    if p in beat75_old_to_new_index and c in beat75_old_to_new_index
+]
+beat75_skeleton_tree = [(p, c, beat75_raw_offsets[c].tolist()) for p, c in beat75_bone_pairs]
+
+beat75_kinematic_chain = [
+    [0, 1, 2, 3, 4, 5, 7],          # spine/head
+    [0, 63, 64, 65, 66, 67],        # right leg
+    [0, 69, 70, 71, 72, 73],        # left leg
+    [4, 9, 10, 11, 12],             # right arm
+    [4, 36, 37, 38, 39],            # left arm
+]

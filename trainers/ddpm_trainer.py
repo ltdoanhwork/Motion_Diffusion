@@ -245,35 +245,84 @@ class DDPMTrainer(object):
             grad = torch.autograd.grad(smooth_energy, x_var, retain_graph=False, create_graph=False)[0]
         return pred - self.inference_guidance_weight * grad.detach()
 
+    def _infer_joints_num_for_fk(self):
+        joints_num = int(getattr(self.opt, "joints_num", 0) or 0)
+        if joints_num > 0:
+            return joints_num
+
+        feat_dim = None
+        if self.motion_mean is not None:
+            feat_dim = int(self.motion_mean.shape[-1])
+        elif self.motion_std is not None:
+            feat_dim = int(self.motion_std.shape[-1])
+        if feat_dim is None or feat_dim <= 0:
+            return 88
+
+        # Prefer explicit BEAT profile shapes first.
+        for cand in (75, 88):
+            if feat_dim in (cand * 3, cand * 6, cand * 6 + 3):
+                return cand
+
+        rep = str(getattr(self.opt, "motion_rep", "axis_angle")).lower()
+        if rep in ("rot6d", "rotation_6d", "6d"):
+            if feat_dim % 6 == 0:
+                return feat_dim // 6
+            if (feat_dim - 3) % 6 == 0:
+                return (feat_dim - 3) // 6
+        else:
+            if feat_dim % 3 == 0:
+                return feat_dim // 3
+            if feat_dim % 6 == 0:
+                return feat_dim // 6
+            if (feat_dim - 3) % 6 == 0:
+                return (feat_dim - 3) // 6
+        return 88
+
+    def _select_skeleton_profile(self, joints_num):
+        if joints_num == 75:
+            return (
+                paramUtil.beat75_bone_pairs,
+                paramUtil.beat75_skeleton_tree,
+                "beat75",
+                75,
+            )
+        return (
+            paramUtil.beat_bone_pairs,
+            paramUtil.beat_skeleton_tree,
+            "beat88",
+            88,
+        )
+
+    def _set_skeleton_tensors(self, raw_bone_pairs, raw_skeleton_tree, profile_name, profile_joints):
+        parents = [p for p, _ in raw_bone_pairs]
+        children = [c for _, c in raw_bone_pairs]
+        self.bone_parent_indices = torch.LongTensor(parents).to(self.device)
+        self.bone_child_indices = torch.LongTensor(children).to(self.device)
+
+        self.optimized_skeleton_tree = []
+        for parent, child, offset in raw_skeleton_tree:
+            offset_tensor = torch.tensor(offset, dtype=torch.float32, device=self.device).view(1, 1, 3, 1)
+            self.optimized_skeleton_tree.append((parent, child, offset_tensor))
+
+        self.skeleton_profile_name = profile_name
+        self.skeleton_num_joints = profile_joints
+
+    def _ensure_skeleton_for_joints(self, joints_num):
+        if getattr(self, "skeleton_num_joints", None) == joints_num:
+            return
+        raw_bone_pairs, raw_skeleton_tree, profile_name, profile_joints = self._select_skeleton_profile(joints_num)
+        self._set_skeleton_tensors(raw_bone_pairs, raw_skeleton_tree, profile_name, profile_joints)
+        print(f"[INFO] Switched FK/geometric skeleton profile to {profile_name} ({profile_joints} joints).")
+
     def _init_skeleton_data(self):
         """
         Hàm này chuẩn bị sẵn toàn bộ dữ liệu xương khớp lên GPU (self.device).
         Sau này khi train, model chỉ việc lấy ra dùng, không cần tạo lại.
         """
-        raw_bone_pairs = paramUtil.beat_bone_pairs
-
-        # Tối ưu: Tách thành 2 Tensor Parent và Child đưa lên GPU ngay lập tức
-        parents = [p for p, c in raw_bone_pairs]
-        children = [c for p, c in raw_bone_pairs]
-        
-        # Lưu vào self để dùng lại sau này
-        self.bone_parent_indices = torch.LongTensor(parents).to(self.device)
-        self.bone_child_indices = torch.LongTensor(children).to(self.device)
-
-        raw_skeleton_tree = paramUtil.beat_skeleton_tree
-
-        # Tối ưu: Pre-process offset thành Tensor trên GPU
-        # Tạo một list mới chứa (parent, child, offset_tensor_gpu)
-        self.optimized_skeleton_tree = []
-        
-        for parent, child, offset in raw_skeleton_tree:
-            # Tạo tensor offset, đưa lên GPU
-            offset_tensor = torch.tensor(offset, dtype=torch.float32, device=self.device)
-            # Reshape sẵn thành (1, 1, 3, 1) để tiện broadcasting trong phép nhân ma trận sau này
-            # Shape cũ: (3) -> Shape mới: (1, 1, 3, 1)
-            offset_tensor = offset_tensor.view(1, 1, 3, 1)
-            
-            self.optimized_skeleton_tree.append((parent, child, offset_tensor))
+        joints_num = self._infer_joints_num_for_fk()
+        raw_bone_pairs, raw_skeleton_tree, profile_name, profile_joints = self._select_skeleton_profile(joints_num)
+        self._set_skeleton_tensors(raw_bone_pairs, raw_skeleton_tree, profile_name, profile_joints)
+        print(f"[INFO] FK/geometric skeleton profile: {self.skeleton_profile_name} ({self.skeleton_num_joints} joints)")
 
     @staticmethod
     def zero_grad(opt_list):
@@ -811,11 +860,18 @@ class DDPMTrainer(object):
         feat_dim = motion_pred.shape[-1]
         rep = str(getattr(self.opt, "motion_rep", "axis_angle")).lower()
         if rep in ("rot6d", "rotation_6d", "6d"):
-            if feat_dim % 6 != 0:
-                raise ValueError(f"Expected rot6d feature dim divisible by 6, got {feat_dim}")
-            n_joints = feat_dim // 6
-            motion_pred_6d = motion_pred.reshape(motion_pred.shape[0], motion_pred.shape[1], n_joints, 6)
-            motion_gt_6d = motion_gt.reshape(motion_gt.shape[0], motion_gt.shape[1], n_joints, 6)
+            # Support both J*6 and (3 + J*6) layout where first 3 dims are root translation.
+            if feat_dim % 6 == 0:
+                rot_pred = motion_pred
+                rot_gt = motion_gt
+            elif (feat_dim - 3) % 6 == 0:
+                rot_pred = motion_pred[:, :, 3:]
+                rot_gt = motion_gt[:, :, 3:]
+            else:
+                raise ValueError(f"Expected rot6d feature dim as J*6 or (3+J*6), got {feat_dim}")
+            n_joints = rot_pred.shape[-1] // 6
+            motion_pred_6d = rot_pred.reshape(rot_pred.shape[0], rot_pred.shape[1], n_joints, 6)
+            motion_gt_6d = rot_gt.reshape(rot_gt.shape[0], rot_gt.shape[1], n_joints, 6)
         else:
             if feat_dim % 3 != 0:
                 raise ValueError(f"Expected axis-angle feature dim divisible by 3, got {feat_dim}")
@@ -929,6 +985,7 @@ class DDPMTrainer(object):
         Output: positions có shape (B, T, n_joints, 3)
         """
         B, T, n_joints, dims = rot6d.shape
+        self._ensure_skeleton_for_joints(n_joints)
         
         # Kiểm tra nhanh: Nếu input là 6D thì dims phải bằng 6
         assert dims == 6, f"Input cho hàm này phải là 6D, nhưng nhận được {dims}D"

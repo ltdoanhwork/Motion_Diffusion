@@ -170,6 +170,25 @@ def check_data_shape(motion_dir):
     print(f"2. Shape gốc: {data.shape}") 
     return data.shape[1] 
 
+
+def infer_beat_joints_num(dim_pose, motion_rep):
+    rep = str(motion_rep).lower()
+    if rep in ("rot6d", "rotation_6d", "6d"):
+        if dim_pose % 6 == 0:
+            return dim_pose // 6
+        if (dim_pose - 3) % 6 == 0:
+            return (dim_pose - 3) // 6
+        return None
+
+    if rep in ("axis_angle", "position", "rep15d"):
+        if dim_pose % 3 == 0 and (dim_pose // 3) in (75, 88):
+            return dim_pose // 3
+        if dim_pose % 6 == 0 and (dim_pose // 6) in (75, 88):
+            return dim_pose // 6
+        if (dim_pose - 3) % 6 == 0 and ((dim_pose - 3) // 6) in (75, 88):
+            return (dim_pose - 3) // 6
+    return None
+
 # -----------------------------------------------------------
 # main
 # -----------------------------------------------------------
@@ -212,7 +231,6 @@ if __name__ == '__main__':
         opt.data_root       = pjoin(ROOT, 'datasets/BEAT_numpy')   
         opt.motion_dir      = pjoin(opt.data_root, 'npy')
         opt.text_dir        = pjoin(opt.data_root, 'txt')
-        opt.joints_num      = 88
         fps                 = 60
         opt.max_motion_length = 360
         real_dim_pose = check_data_shape(opt.motion_dir)
@@ -221,7 +239,18 @@ if __name__ == '__main__':
             print(f"Đã cập nhật dim_pose theo dữ liệu thật: {dim_pose}")
         else:
             dim_pose = 264                                
-        kinematic_chain     = paramUtil.beat_kinematic_chain 
+        inferred_joints = infer_beat_joints_num(dim_pose, getattr(opt, "motion_rep", "axis_angle"))
+        if inferred_joints in (75, 88):
+            opt.joints_num = inferred_joints
+            print(f"[INFO] BEAT joints_num inferred from dim_pose={dim_pose}, motion_rep={opt.motion_rep}: {opt.joints_num}")
+        else:
+            opt.joints_num = 88
+            print(f"[WARN] Could not infer BEAT joints_num from dim_pose={dim_pose}, fallback to 88")
+
+        if opt.joints_num == 75:
+            kinematic_chain = paramUtil.beat75_kinematic_chain
+        else:
+            kinematic_chain = paramUtil.beat_kinematic_chain
         DatasetClass        = Beat2MotionDataset
     
     else:

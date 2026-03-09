@@ -74,6 +74,7 @@ def extract_sentences_with_text(textgrid_path, motion_data, output_dir, fps=30, 
         motion = axis_angle_numpy_to_rot6d(motion)
     elif output_rep not in ('position', 'axis_angle'):
         raise ValueError(f"Unsupported output_rep: {output_rep}")
+    motion = motion.astype(np.float32, copy=False)
 
     max_frames = motion.shape[0]  
       
@@ -151,13 +152,14 @@ def preprocess_motion_data(base_dir, npy_out_dir, txt_out_dir, output_rep='posit
             ('stdscale', ListStandardScaler())
         ])
     elif output_rep in ('axis_angle', 'rot6d'):
-        # Use exponential map as axis-angle-like rotation features from BVH.
-        # rot6d branch is converted from this representation before saving.
+        # IMPORTANT:
+        # Keep axis-angle in its geometric domain (radians) before converting to rot6d.
+        # Do NOT apply StandardScaler here; otherwise axis-angle values lose their
+        # rotational meaning and rot6d conversion becomes invalid.
         data_pipe = Pipeline([
             ('param', MocapParameterizer('expmap')),
             ('np', Numpyfier()),
             ('down', DownSampler(2)),
-            ('stdscale', ListStandardScaler())
         ])
     else:
         raise ValueError(f"Unsupported output_rep: {output_rep}")

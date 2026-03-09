@@ -23,7 +23,7 @@ class BaseOptions():
 
         self.parser.add_argument("--unit_length", type=int, default=4, help="Motions are cropped to the maximum times of unit_length")
         self.parser.add_argument("--max_text_len", type=int, default=20, help="Maximum length of text description")
-        self.parser.add_argument('--motion_rep', type=str, default='axis_angle', choices=['axis_angle', 'rep15d', 'position'],
+        self.parser.add_argument('--motion_rep', type=str, default='axis_angle', choices=['axis_angle', 'rep15d', 'position', 'rot6d', 'rotation_6d', '6d'],
                                  help='Motion representation to use')
         self.parser.add_argument('--text_enc_mod', type=str, default='bigru')
         self.parser.add_argument('--estimator_mod', type=str, default='bigru')

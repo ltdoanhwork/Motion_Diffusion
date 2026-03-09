@@ -61,7 +61,7 @@ taming/
 datasets/BEAT/
 datasets/BEAT_numpy/
 datasets/BEAT_numpy_/
-datasets/BEAT_numpy_old/
+datasets/BEAT_numpy_rot6d/
 datasets/BEAT_indices/
 datasets/HumanML3D/
 datasets/KIT-ML/

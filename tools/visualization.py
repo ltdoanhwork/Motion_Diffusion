@@ -105,6 +105,7 @@ from trainers import DDPMTrainer
 from models import MotionTransformer
 from utils.utils import *
 from utils.motion_process import recover_from_ric
+from datasets.emage_utils.rotation_conversions import axis_angle_to_rotation_6d
 
 def build_models(opt, motion_length=None):
     # Nếu opt không có max_motion_length (thường với BEAT), dùng motion_length tuyến tính
@@ -119,7 +120,89 @@ def build_models(opt, motion_length=None):
         no_eff=opt.no_eff)
     return encoder
 
-def visualize_motion(data, result_path, npy_path, caption, opt):
+def infer_beat_joints_num(dim_pose, motion_rep):
+    rep = str(motion_rep).lower()
+    if rep in ("rot6d", "rotation_6d", "6d"):
+        if dim_pose % 6 == 0:
+            return dim_pose // 6
+        if (dim_pose - 3) % 6 == 0:
+            return (dim_pose - 3) // 6
+        return None
+
+    if rep in ("axis_angle", "position", "rep15d"):
+        if dim_pose % 3 == 0 and (dim_pose // 3) in (75, 88):
+            return dim_pose // 3
+        if dim_pose % 6 == 0 and (dim_pose // 6) in (75, 88):
+            return dim_pose // 6
+        if (dim_pose - 3) % 6 == 0 and ((dim_pose - 3) // 6) in (75, 88):
+            return (dim_pose - 3) // 6
+    return None
+
+
+def _resolve_expected_beat_joints(opt):
+    joints_num = int(getattr(opt, "joints_num", 0) or 0)
+    if joints_num in (75, 88):
+        return joints_num
+
+    dim_pose = int(getattr(opt, "dim_pose", 0) or 0)
+    inferred = infer_beat_joints_num(dim_pose, getattr(opt, "motion_rep", "axis_angle"))
+    if inferred in (75, 88):
+        return inferred
+    return None
+
+
+def _split_beat_motion_channels(data, rep, expected_joints=None):
+    rep = str(rep).lower()
+    if rep == "axis_angle":
+        stride = 3
+        rep_label = "axis_angle"
+    elif rep in ("rot6d", "rotation_6d", "6d"):
+        stride = 6
+        rep_label = "rot6d"
+    else:
+        raise ValueError(f"Unsupported BEAT motion_rep for FK split: {rep}")
+
+    d = int(data.shape[1])
+    candidates = []
+    if d % stride == 0:
+        candidates.append((False, d // stride))
+    if d >= (3 + stride) and (d - 3) % stride == 0:
+        candidates.append((True, (d - 3) // stride))
+    candidates = [(has_root, joints) for has_root, joints in candidates if joints > 0]
+
+    if not candidates:
+        raise ValueError(
+            f"BEAT {rep_label} expects D%{stride}==0 or (D-3)%{stride}==0, got shape {data.shape}"
+        )
+
+    # Prefer candidate that matches known skeleton profile (75/88) and expected joints.
+    filtered = candidates
+    if expected_joints is not None:
+        matched = [c for c in filtered if c[1] == expected_joints]
+        if matched:
+            filtered = matched
+    known = [c for c in filtered if c[1] in (75, 88)]
+    if known:
+        filtered = known
+
+    # If still ambiguous, prefer "no root translation" to avoid false split on 264=88*3.
+    has_root, joints_num = sorted(filtered, key=lambda x: (x[0], x[1]))[0]
+    root_trans = data[:, :3] if has_root else None
+    motion_rot = data[:, 3:] if has_root else data
+    return motion_rot, root_trans, has_root, joints_num
+
+
+def denormalize_motion(motion, mean, std):
+    if motion.shape[-1] != mean.shape[-1] or motion.shape[-1] != std.shape[-1]:
+        raise ValueError(
+            f"Normalization shape mismatch: motion={motion.shape[-1]}, "
+            f"mean={mean.shape[-1]}, std={std.shape[-1]}. "
+            "Please use mean/std from the same representation."
+        )
+    return motion * std + mean
+
+
+def visualize_motion(data, result_path, npy_path, caption, opt, trainer=None, device=None):
     """
     Hàm visualization đa năng cho T2M, KIT và BEAT
     """
@@ -128,16 +211,56 @@ def visualize_motion(data, result_path, npy_path, caption, opt):
     
     # --- XỬ LÝ DỮ LIỆU THEO TỪNG DATASET ---
     if dataset_name == 'beat':
-        # BEAT: Dữ liệu là Position (XYZ) thuần túy -> Chỉ cần Reshape
-        # data shape: (Seq_Len, 264) -> (Seq_Len, 88, 3)
-        print(f"[Info] Processing BEAT data (Pure Position), Shape: {data.shape}")
-        
-        # Reshape về (Frame, Joints, 3)
-        # Lưu ý: Cần đảm bảo data đã được denormalize (nhân std + mean) ở bên ngoài
-        joint = data.reshape(data.shape[0], joints_num, 3)
-        
-        # Lấy kinematic chain của BEAT
-        kinematic_chain = paramUtil.beat_kinematic_chain
+        rep = str(getattr(opt, 'motion_rep', 'axis_angle')).lower()
+        print(f"[Info] Processing BEAT data ({rep}), Shape: {data.shape}")
+
+        if rep == 'position':
+            if data.shape[1] % 3 != 0:
+                raise ValueError(f"BEAT position expects D % 3 == 0, got shape {data.shape}")
+            joints_num = data.shape[1] // 3
+            joint = data.reshape(data.shape[0], joints_num, 3)
+        elif rep in ('axis_angle', 'rot6d', 'rotation_6d', '6d'):
+            if trainer is None:
+                raise ValueError("trainer is required for FK visualization with axis_angle/rot6d.")
+            if device is None:
+                device = torch.device('cpu')
+
+            expected_joints = _resolve_expected_beat_joints(opt)
+            motion_rot, root_trans, has_root, joints_num = _split_beat_motion_channels(
+                data, rep, expected_joints=expected_joints
+            )
+            if joints_num not in (75, 88):
+                raise ValueError(
+                    f"Unsupported BEAT joints_num={joints_num} inferred from shape {data.shape}. "
+                    "Expected 75 or 88 joints."
+                )
+
+            print(
+                f"[Info] Parsed BEAT channels: has_root={has_root}, joints_num={joints_num}, "
+                f"expected_joints={expected_joints}"
+            )
+
+            if rep in ('axis_angle',):
+                aa = torch.from_numpy(motion_rot.astype(np.float32)).view(
+                    1, data.shape[0], joints_num, 3
+                ).to(device)
+                rot6d = axis_angle_to_rotation_6d(aa)
+            else:
+                rot6d = torch.from_numpy(motion_rot.astype(np.float32)).view(
+                    1, data.shape[0], joints_num, 6
+                ).to(device)
+
+            fk_pos = trainer.forward_kinematics(rot6d, motion_raw=None)[0].detach().cpu().numpy()
+            if has_root and root_trans is not None:
+                fk_pos = fk_pos + root_trans[:, None, :]
+            joint = fk_pos
+        else:
+            raise ValueError(f"Unsupported BEAT motion_rep for visualization: {rep}")
+
+        if joints_num == 75:
+            kinematic_chain = paramUtil.beat75_kinematic_chain
+        else:
+            kinematic_chain = paramUtil.beat_kinematic_chain
         
     else:
         # T2M / KIT: Dữ liệu là RIC Features -> Cần recover_from_ric
@@ -226,11 +349,11 @@ if __name__ == '__main__':
             opt.max_motion_length = 196  # KIT default
         
     elif opt.dataset_name == 'beat':
-        opt.data_root = './datasets/BEAT_numpy' # Cập nhật path đúng
-        opt.joints_num = 88   # Đã cập nhật theo phân tích trước
-        opt.dim_pose = 264    # 88 * 3
+        opt.data_root = './datasets/BEAT_numpy'
+        opt.joints_num = 88
+        opt.dim_pose = getattr(opt, 'dim_pose', 264)
         if not hasattr(opt, 'max_motion_length'):
-            opt.max_motion_length = 360  # BEAT default (khớp với checkpoint)
+            opt.max_motion_length = 360
     
     else:
         raise ValueError(f"Unknown dataset name in opt: {opt.dataset_name}")
@@ -246,6 +369,13 @@ if __name__ == '__main__':
     except Exception as e:
         print(f"[Error] Failed to load Mean/Std from {opt.meta_dir}")
         sys.exit(1)
+
+    if opt.dataset_name == 'beat':
+        opt.dim_pose = int(mean.shape[0])
+        inferred_joints = infer_beat_joints_num(opt.dim_pose, getattr(opt, 'motion_rep', 'axis_angle'))
+        if inferred_joints in (75, 88):
+            opt.joints_num = inferred_joints
+        print(f"[Info] BEAT inferred dim_pose={opt.dim_pose}, joints_num={opt.joints_num}, motion_rep={opt.motion_rep}")
 
     # Build Model
     encoder = build_models(opt, motion_length=opt.max_motion_length).to(device)
@@ -280,12 +410,12 @@ if __name__ == '__main__':
             
             print(f"[Info] Generated raw motion shape: {motion.shape}")
 
-            # Denormalize (Quan trọng cho cả 3 dataset)
-            motion = motion * std + mean
+            # Denormalize using stats that match the exact representation.
+            motion = denormalize_motion(motion, mean, std)
             
             title = args.text + " #%d" % motion.shape[0]
             
             # Gọi hàm visualization đa năng
-            visualize_motion(motion, args.result_path, args.npy_path, title, opt)
+            visualize_motion(motion, args.result_path, args.npy_path, title, opt, trainer=trainer, device=device)
             
     print("✅ Done!")
