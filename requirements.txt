@@ -1,10 +1,45 @@
-tqdm
-opencv-python
-scipy
-matplotlib==3.3.1
-spacy
+# tqdm
+# opencv-python
+# scipy
+# matplotlib==3.3.1
+# spacy
 git+https://github.com/openai/CLIP.git
-scikit-learn
-textgrid
-pandas
-numpy
+# scikit-learn
+# textgrid
+# pandas
+# numpy
+
+# --- Core Deep Learning & AI ---
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
+torchaudio==2.6.0+cu124
+diffusers==0.36.0
+transformers==4.57.6
+safetensors==0.7.0
+huggingface-hub==0.36.2
+einops==0.8.2
+accelerate
+
+# --- NLP & Text Processing ---
+spacy==3.8.11
+clip==1.0
+ftfy==6.3.1
+regex==2026.1.15
+
+# --- Data Science & Visualization ---
+numpy==2.0.2
+pandas==2.3.3
+scipy==1.13.1
+scikit-learn==1.6.1
+matplotlib==3.3.1
+opencv-python==4.13.0.92
+
+# --- Utilities ---
+tqdm==4.67.3
+pydantic==2.12.5
+rich==14.3.3
+pyyaml==6.0.3
+pillow==11.3.0
+psutil==7.0.0
+ipykernel

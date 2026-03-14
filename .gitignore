@@ -88,3 +88,5 @@ emage_evaltools/
 hf_*
 global_pipeline*.pkl
 emage_evaltools/smplx_models/smplx/SMPLX_NEUTRAL_2020.npz
+
+motiondiff/
