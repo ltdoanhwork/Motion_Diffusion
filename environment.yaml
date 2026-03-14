@@ -1,0 +1,36 @@
+name: motiondiff
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - spacy=3.8.11
+  - pip
+  - ca-certificates
+  - openssl
+  - sqlite
+  - ipykernel
+  - psutil
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu124
+      - torch==2.6.0+cu124
+      - torchvision==0.21.0+cu124
+      - torchaudio==2.6.0+cu124
+      - diffusers==0.36.0
+      - transformers==4.57.6
+      - accelerate
+      - safetensors
+      - huggingface-hub
+      - numpy==2.0.2
+      - pandas
+      - scipy
+      - scikit-learn
+      - matplotlib==3.3.1
+      - opencv-python==4.13.0.92
+      - spacy==3.8.11
+      - cupy-cuda12x  
+      - pydantic
+      - tqdm
+      - einops
+      - ftfy
+      - regex
